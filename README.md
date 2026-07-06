@@ -42,6 +42,9 @@ one clearly-marked real-process integration module).
 | `DBT_FIXER_SLACK_CHANNEL` | no | `None` | Free text; unset means Slack delivery is skipped (a no-op), not an error. |
 | `DBT_FIXER_AUDITOR_PYTHON` | no | `None` | Free text path to the sibling auditor's interpreter; unset is a hard `no_safe_fix` at re-audit-gate time (a later sprint), never a skipped gate. |
 | `DBT_FIXER_MAX_ROUNDS` | no | `3` | Non-numeric, or outside `[1, 10]` → falls back to `3` and records a warning (never crashes, never clamps to the nearest bound). |
+| `DBT_FIXER_MAX_CHANGED_FILES` | no | `5` | Non-numeric, or outside `[1, 50]` → falls back to `5` and records a warning. Enforced by the Sprint 3 allowlist gate. |
+| `DBT_FIXER_MAX_CHANGED_LINES` | no | `60` | Non-numeric, or outside `[1, 2000]` → falls back to `60` and records a warning. Enforced by the Sprint 3 allowlist gate. |
+| `DBT_FIXER_REAUDIT_TIMEOUT_SECONDS` | no | `120` | Non-numeric, or outside `[1, 1800]` → falls back to `120` and records a warning. Bounds the Sprint 3 re-audit gate's subprocess call. |
 
 ### Bounded-execution primitive (`dbt_fixer.bounds`)
 
@@ -90,12 +93,15 @@ src/dbt_fixer/
   applier.py              # fail-closed, two-phase application of a Proposal onto an isolated scratch copy
   diffing.py               # pure difflib unified-diff generation, matching real `git diff` semantics
   fix_pipeline.py           # Stage 2 orchestration: read -> propose -> apply -> diff, fully offline-testable
+  diffparse.py               # pure-Python parser/applier for the diffing.py unified-diff dialect
+  allowlist.py                # deterministic Allowlist Classifier Gate -- no model call, ever
+  reaudit.py                   # Re-Audit Gate: injectable-subprocess integration with the sealed sibling auditor
+  retry_loop.py                 # Stage 3: bounded propose/apply/allowlist/re-audit loop + terminal status
 ```
 
-Later sprints add the allowlist and re-audit gates, the fix-refuter and
-`dbt parse` gates, the bounded retry loop, and the Slack/stdout delivery
-contract — each with its own additions to this README's environment-contract
-tables.
+Later sprints add the fix-refuter and `dbt parse` gates and the Slack/stdout
+delivery contract — each with its own additions to this README's
+environment-contract tables.
 
 ## Sprint 2: path-safe repo tools, structured fix proposal, scratch-copy applier
 
@@ -153,3 +159,52 @@ Two additional, unprefixed environment variables (matching the sibling
 
 AWS credentials are always resolved via boto3's default credential chain;
 no access key, secret key, or profile is ever hardcoded.
+
+## Sprint 3: the deterministic gates and the bounded retry loop
+
+**The Allowlist Classifier Gate (`dbt_fixer.allowlist`) never calls a model.**
+`run_allowlist_gate` is ordinary, deterministic Python control flow over an
+already-parsed candidate diff (`dbt_fixer.diffparse`): the same candidate
+run through it any number of times always produces the same
+`AllowlistVerdict`. It rejects, in this fixed order, a malformed/unparseable
+or true no-op candidate; any touched path outside `models/*.{yml,yaml,md,sql}`;
+exceeding `DBT_FIXER_MAX_CHANGED_FILES`/`DBT_FIXER_MAX_CHANGED_LINES`, or
+touching a hook, a `materialized` config change, or a masking/bypass
+keyword (checked independently of the caps); a `.sql` deletion that isn't
+an exact restore of a line the original PR diff itself removed from that
+same file; and a removed/weakened dbt schema test in a `.yml`/`.yaml` file
+— categorically for `failure_kind=ci`, or for `failure_kind=audit` only
+when none of the originally-failing checks both names that test and
+explicitly proves it wrong in its evidence text.
+
+**The Re-Audit Gate (`dbt_fixer.reaudit`) re-runs the sealed sibling
+`dbt_auditor` package against the candidate.** `run_reaudit_gate` applies
+the candidate diff to its own fresh scratch copy of the checkout and
+invokes `dbt_auditor.entrypoint` via an injectable `SubprocessRunner`
+(a fake in every test — never a real subprocess) in shadow mode, with no
+Slack channel ever set. It distinguishes three failure shapes that are
+never conflated: a missing or uninvokable `DBT_FIXER_AUDITOR_PYTHON`
+interpreter is a `hard_no_safe_fix` (no amount of retrying fixes a missing
+interpreter); a nonzero exit, a timeout, or stdout that doesn't parse into
+a recognized `completed`/verdict shape is an ordinary gate violation; and a
+`BLOCKED` verdict, or (for `failure_kind=audit`) any originally-failing
+check not confirmed passing, is also an ordinary gate violation — distinct
+from both a pass and the hard interpreter stop.
+
+**The Bounded Retry Loop (`dbt_fixer.retry_loop`) wires it all together.**
+`run_bounded_fix_attempt` repeats propose → apply → allowlist → re-audit
+for at most `DBT_FIXER_MAX_ROUNDS` independent rounds (never resubmitting
+the same candidate), feeding each rejected round's specific violation
+reason into the next round's proposal prompt as feedback
+(`dbt_fixer.proposal.build_proposal_prompt`'s new optional `feedback`
+parameter). It always resolves to exactly one of the closed
+`proposed`/`no_safe_fix`/`failed` vocabulary: `proposed` only when the same
+round's same candidate passed every gate; `no_safe_fix` for every ordinary
+exhaustion path, including the auditor-interpreter hard stop, which ends
+the attempt immediately rather than burning the remaining rounds;
+`failed` reserved for a genuine bug backstop, never used for an ordinary
+rejected candidate or a missing interpreter. The function itself never
+raises, and every scratch directory used along the way is created and torn
+down by whichever gate/pipeline call owns it — verified in
+`tests/test_retry_loop.py` to leave no `dbt-fixer-scratch-*` temp directory
+behind across every terminal outcome, including the `failed` backstop.
