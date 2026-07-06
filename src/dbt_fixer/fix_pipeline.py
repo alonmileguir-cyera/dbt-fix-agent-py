@@ -51,6 +51,7 @@ def run_fix_pipeline(
     fenced_context: FencedContext,
     runner: ModelRunner,
     budget: ExecutionBudget,
+    feedback: Optional[str] = None,
 ) -> FixPipelineResult:
     """Run one full, offline, read-propose-apply-diff pipeline pass.
 
@@ -63,6 +64,10 @@ def run_fix_pipeline(
             runner in production, a fake in every test).
         budget: The shared `ExecutionBudget` bounding this pass's wall-clock
             time, tool calls, and turns.
+        feedback: Optional prior-round rejection reason (see
+            `dbt_fixer.proposal.build_proposal_prompt`), threaded straight
+            through into this round's prompt. `None` (the default) produces
+            the exact same prompt as a first-round call always has.
 
     Returns:
         A `FixPipelineResult`. `ok=True` with `diff` set on success;
@@ -72,7 +77,7 @@ def run_fix_pipeline(
     """
 
     repo_root = Path(repo_root)
-    prompt = build_proposal_prompt(fenced_context)
+    prompt = build_proposal_prompt(fenced_context, feedback)
     pass_result = run_proposal_pass(runner, prompt, budget)
 
     if not pass_result.ok:

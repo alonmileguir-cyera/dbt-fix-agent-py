@@ -192,16 +192,27 @@ def parse_proposal(raw: object) -> Optional[Proposal]:
     return Proposal(edits=tuple(edits), rationale=rationale.strip())
 
 
-def build_proposal_prompt(fenced_context: FencedContext) -> str:
+def build_proposal_prompt(fenced_context: FencedContext, feedback: Optional[str] = None) -> str:
     """Build the full prompt for the structured-fix-proposal pass.
 
     The fenced context is rendered and appended verbatim (see
     `FencedContext.render`) -- never re-escaped, re-wrapped, or otherwise
     modified -- after the fixed instructions block, so a test asserting the
     prompt contains the exact fenced rendering as a substring always holds.
+
+    `feedback`, when provided (a bounded retry loop's previous-round gate
+    rejection reason), is appended as a final, clearly-labeled section so the
+    model can address the *specific* violation that sank the last candidate.
+    It is plain diagnostic text produced by this package's own gates, not
+    untrusted PR/CI content, so it is rendered as-is rather than fenced.
+    Omitted or falsy, the prompt is identical to a first-round call --
+    existing callers that never pass `feedback` see no change in behavior.
     """
 
-    return "\n\n".join([PROPOSAL_INSTRUCTIONS.strip(), fenced_context.render()])
+    parts = [PROPOSAL_INSTRUCTIONS.strip(), fenced_context.render()]
+    if feedback:
+        parts.append(f"## Previous attempt feedback\n\n{feedback}")
+    return "\n\n".join(parts)
 
 
 # A model runner is a plain callable: given the full prompt, it returns raw
