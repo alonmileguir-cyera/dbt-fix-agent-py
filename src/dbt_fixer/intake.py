@@ -62,6 +62,12 @@ _AUDIT_CHECK_RE = re.compile(
 
 _FAILING_STATUS_TOKENS = ("FAIL", "FAILING", "BLOCKED", "ERROR")
 
+# Public aliases for the audit-report check-entry grammar, reused as-is by
+# `dbt_fixer.reaudit` to parse the re-audit gate's own rendered-report
+# extension block without duplicating (and risking drift from) this regex.
+AUDIT_CHECK_ENTRY_RE = _AUDIT_CHECK_RE
+FAILING_STATUS_TOKENS = _FAILING_STATUS_TOKENS
+
 
 @dataclass(frozen=True)
 class FailingCheck:

@@ -1,0 +1,351 @@
+"""The Re-Audit Gate: independent proof from the sealed sibling `dbt_auditor`.
+
+Where the allowlist gate (`dbt_fixer.allowlist`) is pure code with an
+opinion about *shape*, this gate asks a completely independent process --
+the same sealed auditor package that found the original problem -- whether
+the candidate fix actually *works*. It never trusts the fixer's own model
+pass's narration; it only ever reads the auditor subprocess's own,
+line-anchored stdout.
+
+**Subprocess invocation.** The auditor is invoked as a subprocess (never
+imported and called in-process -- it is a sealed, independent package) via
+an injectable `SubprocessRunner`, always:
+
+- pointed at a scratch copy of `repo_root` with the candidate diff applied
+  on top -- since `repo_root` already reflects the original PR diff, this
+  scratch copy is the "original PR diff + candidate fix diff" combined
+  state the auditor re-audits;
+- run with `DBT_AUDITOR_SHADOW_MODE` explicitly on and no
+  `DBT_AUDITOR_SLACK_CHANNEL` set at all, so the sealed auditor never posts
+  anywhere on this run's behalf;
+- bounded by an explicit timeout.
+
+**Stdout contract.** Only two real, confirmed lines from the sibling
+package's actual `entrypoint.py` are read: `dbt-auditor-audit-status:
+completed|failed` and `dbt-auditor verdict: <VERDICT> - <reason>`. This
+module additionally recognizes its own report-block extension --
+`dbt-auditor-report-begin` / `dbt-auditor-report-end`, wrapping the same
+`- check: <id>` grammar `dbt_fixer.intake` already parses for inbound audit
+reports -- so the gate can check every originally-failing identifier
+individually for `kind="audit"` runs; that block is optional, and its
+absence for a `kind="ci"` run (which never needs it) is not an error.
+
+**Three distinct honest failure shapes**, never conflated:
+
+1. `hard_no_safe_fix` -- the auditor interpreter is missing/unconfigured or
+   cannot be invoked at all. This is never a skipped or passed gate.
+2. An ordinary gate failure -- a nonzero exit, a timeout, unparsable
+   stdout, a `BLOCKED` verdict, or (for `kind="audit"`) a still-failing
+   originally-named check.
+3. Success -- a non-`BLOCKED` verdict and, for `kind="audit"`, every
+   originally-failing check identifier now scoring passing.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Dict, Mapping, Optional, Tuple
+
+from .diffparse import DiffParseError, PatchApplyError, apply_diff
+from .env import FailureKind
+from .intake import AUDIT_CHECK_ENTRY_RE, FAILING_STATUS_TOKENS
+from .pathsafe import PathTraversalError
+from .scratch import ScratchCopyError, scratch_copy
+
+__all__ = [
+    "AuditorInvocationError",
+    "ProcessOutcome",
+    "SubprocessRunner",
+    "ReAuditVerdict",
+    "build_auditor_env",
+    "build_auditor_args",
+    "parse_auditor_stdout",
+    "run_reaudit_gate",
+]
+
+ENTRYPOINT_MODULE = "dbt_auditor.entrypoint"
+
+_AUDIT_STATUS_LINE_RE = re.compile(r"^dbt-auditor-audit-status:\s*(?P<status>\w+)\s*$", re.MULTILINE)
+_VERDICT_LINE_RE = re.compile(
+    r"^dbt-auditor verdict:\s*(?P<verdict>\w+)\s*-\s*(?P<reason>.*)$", re.MULTILINE
+)
+_REPORT_BLOCK_RE = re.compile(
+    r"dbt-auditor-report-begin\n(?P<body>.*?)\ndbt-auditor-report-end", re.DOTALL
+)
+
+_NON_BLOCKED_VERDICTS = ("PASSED", "NEEDS_REVIEW")
+_BLOCKED_VERDICT = "BLOCKED"
+
+
+class AuditorInvocationError(RuntimeError):
+    """Raised by a `SubprocessRunner` when the auditor interpreter cannot be found/started.
+
+    Distinct from a completed process that exits nonzero: this is for the
+    case the process never even started (missing interpreter, permission
+    denied, etc.), which `run_reaudit_gate` always maps to a hard
+    `no_safe_fix`, never an ordinary gate failure.
+    """
+
+
+@dataclass(frozen=True)
+class ProcessOutcome:
+    """The result of one completed subprocess invocation."""
+
+    returncode: int
+    stdout: str
+    stderr: str = ""
+
+
+SubprocessRunner = Callable[[list, Mapping[str, str], Path, float], ProcessOutcome]
+
+
+@dataclass(frozen=True)
+class ReAuditVerdict:
+    """The re-audit gate's outcome for one candidate diff.
+
+    `hard_no_safe_fix=True` marks the one case (missing/uninvokable
+    auditor interpreter) that must never be treated as an ordinary gate
+    failure or a skip.
+    """
+
+    passed: bool
+    hard_no_safe_fix: bool = False
+    violation: Optional[str] = None
+    reason: str = ""
+    auditor_verdict: Optional[str] = None
+    checked_identifiers: Tuple[str, ...] = field(default_factory=tuple)
+
+
+def build_auditor_env(
+    *,
+    repo_path: "str | Path",
+    pr_diff: str,
+    pr_title: str,
+    pr_description: str,
+    pr_url: str,
+) -> Dict[str, str]:
+    """Build the sealed auditor's real `DBT_AUDITOR_*` env contract for this run.
+
+    Always sets shadow mode on and deliberately never sets
+    `DBT_AUDITOR_SLACK_CHANNEL` -- the re-audit gate never lets the sealed
+    auditor post anywhere on this run's behalf.
+    """
+
+    return {
+        "DBT_AUDITOR_REPO_PATH": str(repo_path),
+        "DBT_AUDITOR_PR_DIFF": pr_diff,
+        "DBT_AUDITOR_PR_TITLE": pr_title,
+        "DBT_AUDITOR_PR_DESCRIPTION": pr_description,
+        "DBT_AUDITOR_PR_URL": pr_url,
+        "DBT_AUDITOR_SHADOW_MODE": "true",
+    }
+
+
+def build_auditor_args(auditor_python: str) -> list:
+    """Build the subprocess argv for invoking the sealed auditor as a module."""
+
+    return [auditor_python, "-m", ENTRYPOINT_MODULE]
+
+
+@dataclass(frozen=True)
+class _ParsedStdout:
+    status: Optional[str]
+    verdict: Optional[str]
+    verdict_reason: str
+    check_statuses: Dict[str, str]
+
+
+def parse_auditor_stdout(stdout: str) -> _ParsedStdout:
+    """Parse the auditor's line-anchored stdout contract.
+
+    Returns a `_ParsedStdout` with `status`/`verdict` set to `None` when
+    their respective line is absent or does not match -- this function
+    never raises, so `run_reaudit_gate` can treat "absent" and "present but
+    unparsable" identically as an honest gate failure.
+    """
+
+    status_match = _AUDIT_STATUS_LINE_RE.search(stdout)
+    verdict_match = _VERDICT_LINE_RE.search(stdout)
+
+    check_statuses: Dict[str, str] = {}
+    report_match = _REPORT_BLOCK_RE.search(stdout)
+    if report_match is not None:
+        for entry in AUDIT_CHECK_ENTRY_RE.finditer(report_match.group("body") + "\n"):
+            identifier = entry.group("id").strip()
+            status = (entry.group("status") or "").strip()
+            check_statuses[identifier] = status
+
+    return _ParsedStdout(
+        status=status_match.group("status") if status_match else None,
+        verdict=verdict_match.group("verdict").upper() if verdict_match else None,
+        verdict_reason=verdict_match.group("reason").strip() if verdict_match else "",
+        check_statuses=check_statuses,
+    )
+
+
+def _check_is_passing(status: str) -> bool:
+    upper = status.upper()
+    return status != "" and not any(token in upper for token in FAILING_STATUS_TOKENS)
+
+
+def run_reaudit_gate(
+    *,
+    repo_root: "str | Path",
+    candidate_diff: str,
+    pr_diff: str,
+    pr_title: str,
+    pr_description: str,
+    pr_url: str,
+    auditor_python: Optional[str],
+    failure_kind: FailureKind,
+    originally_failing_check_ids: Tuple[str, ...],
+    timeout_seconds: float,
+    subprocess_runner: SubprocessRunner,
+) -> ReAuditVerdict:
+    """Run the re-audit gate for one candidate diff against the sealed auditor.
+
+    Args:
+        repo_root: The original checkout (already reflecting the PR's own
+            diff). Never mutated: a fresh scratch copy is made, the
+            candidate diff is applied to *that*, and only the scratch copy
+            is ever handed to the auditor subprocess.
+        candidate_diff: The unified diff text for this round's candidate.
+        pr_diff, pr_title, pr_description, pr_url: Forwarded verbatim into
+            the sealed auditor's own `DBT_AUDITOR_*` env contract.
+        auditor_python: Path to the Python interpreter to run the sealed
+            auditor with, or `None` if unconfigured.
+        failure_kind: `"ci"` or `"audit"` -- selects whether the
+            all-originally-failing-checks-must-now-pass rule applies.
+        originally_failing_check_ids: The check identifiers this run was
+            meant to fix (only consulted for `failure_kind="audit"`).
+        timeout_seconds: The bound handed to `subprocess_runner`.
+        subprocess_runner: The injectable subprocess invocation callable
+            (a real one in production, a fake in every test). Raising
+            `AuditorInvocationError` signals the interpreter could not be
+            found or started at all.
+
+    Returns:
+        A `ReAuditVerdict`. Never raises: every failure mode (missing
+        interpreter, scratch-copy error, candidate-apply error, nonzero
+        exit, timeout, unparsable stdout, `BLOCKED` verdict, a still-
+        failing named check) resolves to a `ReAuditVerdict` field, never an
+        exception escaping this function.
+    """
+
+    if not auditor_python:
+        return ReAuditVerdict(
+            passed=False,
+            hard_no_safe_fix=True,
+            violation="auditor_interpreter_missing",
+            reason="DBT_FIXER_AUDITOR_PYTHON is not configured; the sealed auditor cannot be invoked",
+        )
+
+    repo_root = Path(repo_root)
+
+    try:
+        with scratch_copy(repo_root) as scratch_root:
+            try:
+                apply_diff(scratch_root, candidate_diff)
+            except (DiffParseError, PatchApplyError, PathTraversalError) as exc:
+                return ReAuditVerdict(
+                    passed=False,
+                    violation="candidate_diff_did_not_apply",
+                    reason=f"candidate diff could not be applied for re-audit: {exc}",
+                )
+
+            env = build_auditor_env(
+                repo_path=scratch_root,
+                pr_diff=pr_diff,
+                pr_title=pr_title,
+                pr_description=pr_description,
+                pr_url=pr_url,
+            )
+            args = build_auditor_args(auditor_python)
+
+            try:
+                outcome = subprocess_runner(args, env, scratch_root, timeout_seconds)
+            except AuditorInvocationError as exc:
+                return ReAuditVerdict(
+                    passed=False,
+                    hard_no_safe_fix=True,
+                    violation="auditor_interpreter_missing",
+                    reason=f"the sealed auditor could not be invoked: {exc}",
+                )
+    except ScratchCopyError as exc:
+        return ReAuditVerdict(
+            passed=False,
+            violation="scratch_copy_failed",
+            reason=f"could not create a scratch copy for re-audit: {exc}",
+        )
+
+    if outcome.returncode != 0:
+        return ReAuditVerdict(
+            passed=False,
+            violation="auditor_nonzero_exit",
+            reason=(
+                f"the sealed auditor exited with code {outcome.returncode}; "
+                f"stderr: {outcome.stderr.strip()!r}"
+            ),
+        )
+
+    parsed = parse_auditor_stdout(outcome.stdout)
+
+    if parsed.status is None or parsed.status.lower() != "completed":
+        return ReAuditVerdict(
+            passed=False,
+            violation="auditor_output_unparsable",
+            reason=(
+                "the sealed auditor's stdout does not contain a recognized "
+                f"'dbt-auditor-audit-status: completed' line (status={parsed.status!r})"
+            ),
+        )
+
+    if parsed.verdict is None:
+        return ReAuditVerdict(
+            passed=False,
+            violation="auditor_output_unparsable",
+            reason="the sealed auditor's stdout does not contain a recognized verdict line",
+        )
+
+    if parsed.verdict == _BLOCKED_VERDICT:
+        return ReAuditVerdict(
+            passed=False,
+            violation="auditor_verdict_blocked",
+            reason=f"the sealed auditor's re-audit verdict is BLOCKED: {parsed.verdict_reason}",
+            auditor_verdict=parsed.verdict,
+        )
+
+    if parsed.verdict not in _NON_BLOCKED_VERDICTS:
+        return ReAuditVerdict(
+            passed=False,
+            violation="auditor_output_unparsable",
+            reason=f"the sealed auditor returned an unrecognized verdict: {parsed.verdict!r}",
+            auditor_verdict=parsed.verdict,
+        )
+
+    if failure_kind == "audit" and originally_failing_check_ids:
+        still_failing = [
+            identifier
+            for identifier in originally_failing_check_ids
+            if not _check_is_passing(parsed.check_statuses.get(identifier, ""))
+        ]
+        if still_failing:
+            return ReAuditVerdict(
+                passed=False,
+                violation="auditor_check_still_failing",
+                reason=(
+                    "the following originally-failing check(s) do not yet score passing "
+                    f"in the re-audit report: {', '.join(still_failing)}"
+                ),
+                auditor_verdict=parsed.verdict,
+                checked_identifiers=tuple(originally_failing_check_ids),
+            )
+
+    return ReAuditVerdict(
+        passed=True,
+        reason=f"re-audit verdict {parsed.verdict} is non-blocked; all required checks pass",
+        auditor_verdict=parsed.verdict,
+        checked_identifiers=tuple(originally_failing_check_ids),
+    )
