@@ -1,18 +1,31 @@
 """Stage 2+3: the bounded retry loop and terminal status resolution.
 
 This is the seam that wires the structured-fix-proposal pass
-(`dbt_fixer.fix_pipeline.run_fix_pipeline`) and the two Sprint 3 gates
+(`dbt_fixer.fix_pipeline.run_fix_pipeline`) and all four gates
 (`dbt_fixer.allowlist.run_allowlist_gate`,
-`dbt_fixer.reaudit.run_reaudit_gate`) into a single bounded attempt:
+`dbt_fixer.reaudit.run_reaudit_gate`,
+`dbt_fixer.refuter.run_fix_refuter_gate`,
+`dbt_fixer.dbt_parse.run_dbt_parse_gate`) into a single bounded attempt:
 
-    propose -> apply -> allowlist -> re-audit
+    propose -> apply -> allowlist -> re-audit -> fix-refuter -> dbt parse
 
-repeated for at most `FixerConfig.max_rounds` rounds. Each round is
-independent: a fresh proposal is generated every time (never the same
-candidate re-submitted), and a rejected round's *specific* violation reason
-is fed back into the next round's proposal prompt via
-`dbt_fixer.proposal.build_proposal_prompt`'s `feedback` parameter, so the
-model has a concrete reason to change course rather than repeating itself.
+repeated for at most `FixerConfig.max_rounds` rounds, in exactly
+`dbt_fixer.status.GATE_ORDER`. Each round is independent: a fresh proposal
+is generated every time (never the same candidate re-submitted), and a
+rejected round's *specific* violation reason is fed back into the next
+round's proposal prompt via `dbt_fixer.proposal.build_proposal_prompt`'s
+`feedback` parameter, so the model has a concrete reason to change course
+rather than repeating itself.
+
+**The dbt parse gate is the one non-authoritative gate.** Allowlist and
+re-audit must both pass for a round to proceed; the fix-refuter gate must
+also affirmatively pass (an unambiguous "could not refute"). The dbt parse
+gate, by contrast, only ever *blocks* a round when it actually ran and
+failed (a real nonzero exit or timeout) -- a `"skipped"` outcome (no `dbt`
+on PATH, or a scratch/apply-setup problem) never itself blocks a round,
+and never itself grants one either: it is simply recorded, visibly, as
+skipped in that round's gate list, and the round's outcome is decided
+entirely by the three required gates.
 
 Terminal status resolution is exactly the closed vocabulary in
 `dbt_fixer.status`:
@@ -28,10 +41,11 @@ Terminal status resolution is exactly the closed vocabulary in
   package, not a bad candidate or a bad environment) that none of the
   narrower, already-never-raising layers underneath this one caught. Every
   one of those layers (`run_fix_pipeline`, `run_allowlist_gate`,
-  `run_reaudit_gate`) already resolves its own ordinary failure modes to a
-  typed, non-exceptional result; this module's own `except Exception`
-  backstop exists only so a defect in this wiring itself still resolves to
-  an honest status instead of an unhandled crash.
+  `run_reaudit_gate`, `run_fix_refuter_gate`, `run_dbt_parse_gate`) already
+  resolves its own ordinary failure modes to a typed, non-exceptional
+  result; this module's own `except Exception` backstop exists only so a
+  defect in this wiring itself still resolves to an honest status instead
+  of an unhandled crash.
 
 Every scratch directory involved (one per `run_fix_pipeline` call, one per
 gate call) is created and torn down entirely inside those callees --
@@ -42,24 +56,29 @@ regardless of which round or gate is the one that ends the attempt.
 
 from __future__ import annotations
 
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional, Tuple
 
 from .allowlist import AllowlistCaps, AllowlistVerdict, run_allowlist_gate
 from .bounds import ExecutionBudget
+from .dbt_parse import DbtParseVerdict, DbtSubprocessRunner, WhichFunc, run_dbt_parse_gate
 from .env import FixerConfig
 from .fencing import FencedContext
 from .fix_pipeline import run_fix_pipeline
 from .intake import FailureTarget
 from .proposal import ModelRunner
 from .reaudit import ReAuditVerdict, SubprocessRunner, run_reaudit_gate
+from .refuter import RefuterRunner, RefuterVerdict, run_fix_refuter_gate
 from .status import GateResult, RunResult
 
 __all__ = ["FixAttemptResult", "run_bounded_fix_attempt"]
 
 AllowlistGateRunner = Callable[..., AllowlistVerdict]
 ReAuditGateRunner = Callable[..., ReAuditVerdict]
+RefuterGateRunner = Callable[..., RefuterVerdict]
+DbtParseGateRunner = Callable[..., DbtParseVerdict]
 
 
 @dataclass(frozen=True)
@@ -81,8 +100,8 @@ class FixAttemptResult:
     rounds_used: int = 0
 
 
-def _skip_reaudit_gate(reason: str) -> GateResult:
-    return GateResult(name="re-audit", outcome="skipped", detail=reason)
+def _skip_gate(name: str, reason: str) -> GateResult:
+    return GateResult(name=name, outcome="skipped", detail=reason)
 
 
 def run_bounded_fix_attempt(
@@ -93,15 +112,22 @@ def run_bounded_fix_attempt(
     repo_root: "str | Path",
     model_runner: ModelRunner,
     subprocess_runner: SubprocessRunner,
+    refuter_runner: RefuterRunner,
+    dbt_subprocess_runner: DbtSubprocessRunner,
     budget: ExecutionBudget,
     allowlist_gate: AllowlistGateRunner = run_allowlist_gate,
     reaudit_gate: ReAuditGateRunner = run_reaudit_gate,
+    refuter_gate: RefuterGateRunner = run_fix_refuter_gate,
+    dbt_parse_gate: DbtParseGateRunner = run_dbt_parse_gate,
+    which: WhichFunc = shutil.which,
 ) -> FixAttemptResult:
-    """Run the bounded propose/apply/allowlist/re-audit loop for one attempt.
+    """Run the bounded propose/apply/allowlist/re-audit/fix-refuter/dbt-parse
+    loop for one attempt.
 
     Args:
         config: The validated run configuration; `max_rounds`,
             `max_changed_files`, `max_changed_lines`, `reaudit_timeout_seconds`,
+            `refuter_timeout_seconds`, `dbt_parse_timeout_seconds`,
             `auditor_python`, `failure_kind`, and every `pr_*` field are all
             read from here.
         target: The parsed `FailureTarget` from `dbt_fixer.intake` -- its
@@ -109,11 +135,18 @@ def run_bounded_fix_attempt(
             test-weakening proof) and its `identifiers` to the re-audit gate
             (as the set of originally-failing checks that must now pass).
         fenced_context: The already-fenced failure/PR context rendered into
-            every round's proposal prompt.
+            every round's proposal prompt, and into every round's
+            fix-refuter prompt.
         repo_root: The original, never-mutated checkout root.
         model_runner: The structured-fix-proposal model runner.
         subprocess_runner: The injectable auditor-subprocess runner (a fake
             in every test; never a real subprocess).
+        refuter_runner: The injectable fix-refuter model runner (a fake in
+            every test). Callers must supply one that starts a fresh,
+            isolated context per call -- never the same conversation the
+            proposal pass used.
+        dbt_subprocess_runner: The injectable `dbt parse` subprocess runner
+            (a fake in every test; never a real subprocess).
         budget: The shared `ExecutionBudget` bounding *every* round's model
             call cumulatively -- a slow or stalled model call in round 1
             can still exhaust the budget and end round 2 early.
@@ -121,6 +154,12 @@ def run_bounded_fix_attempt(
             to the real `run_allowlist_gate`. Overridable in tests to force
             an unexpected exception and exercise the `failed` backstop.
         reaudit_gate: Same, for the re-audit gate.
+        refuter_gate: Same, for the fix-refuter gate, defaulting to the real
+            `run_fix_refuter_gate`.
+        dbt_parse_gate: Same, for the dbt parse gate, defaulting to the real
+            `run_dbt_parse_gate`.
+        which: Injectable PATH-lookup callable handed through to the dbt
+            parse gate, defaulting to `shutil.which`.
 
     Returns:
         A `FixAttemptResult`. Never raises: any exception escaping the
@@ -167,7 +206,9 @@ def run_bounded_fix_attempt(
             if not allowlist_verdict.passed:
                 last_gates = [
                     GateResult(name="allowlist", outcome="fail", detail=allowlist_verdict.reason),
-                    _skip_reaudit_gate("allowlist gate rejected this candidate"),
+                    _skip_gate("re-audit", "allowlist gate rejected this candidate"),
+                    _skip_gate("fix-refuter", "allowlist gate rejected this candidate"),
+                    _skip_gate("dbt parse", "allowlist gate rejected this candidate"),
                 ]
                 last_reason = allowlist_verdict.reason
                 feedback = (
@@ -201,6 +242,8 @@ def run_bounded_fix_attempt(
                 last_gates = [
                     allowlist_pass_gate,
                     GateResult(name="re-audit", outcome="fail", detail=reaudit_verdict.reason),
+                    _skip_gate("fix-refuter", "re-audit gate reported a hard no-safe-fix condition"),
+                    _skip_gate("dbt parse", "re-audit gate reported a hard no-safe-fix condition"),
                 ]
                 return FixAttemptResult(
                     run_result=RunResult(
@@ -213,6 +256,8 @@ def run_bounded_fix_attempt(
                 last_gates = [
                     allowlist_pass_gate,
                     GateResult(name="re-audit", outcome="fail", detail=reaudit_verdict.reason),
+                    _skip_gate("fix-refuter", "re-audit gate rejected this candidate"),
+                    _skip_gate("dbt parse", "re-audit gate rejected this candidate"),
                 ]
                 last_reason = reaudit_verdict.reason
                 feedback = (
@@ -221,11 +266,74 @@ def run_bounded_fix_attempt(
                 )
                 continue
 
+            reaudit_pass_gate = GateResult(
+                name="re-audit", outcome="pass", detail=reaudit_verdict.reason
+            )
+
+            refuter_verdict = refuter_gate(
+                fenced_context=fenced_context,
+                candidate_diff=candidate_diff,
+                refuter_runner=refuter_runner,
+                timeout_seconds=config.refuter_timeout_seconds,
+            )
+
+            if not refuter_verdict.passed:
+                last_gates = [
+                    allowlist_pass_gate,
+                    reaudit_pass_gate,
+                    GateResult(name="fix-refuter", outcome="fail", detail=refuter_verdict.reason),
+                    _skip_gate("dbt parse", "fix-refuter gate rejected this candidate"),
+                ]
+                last_reason = refuter_verdict.reason
+                feedback = (
+                    f"round {round_num} was rejected by the fix-refuter gate: "
+                    f"{refuter_verdict.reason}"
+                )
+                continue
+
+            fix_refuter_pass_gate = GateResult(
+                name="fix-refuter", outcome="pass", detail=refuter_verdict.reason
+            )
+
+            dbt_parse_verdict = dbt_parse_gate(
+                repo_root=repo_root,
+                candidate_diff=candidate_diff,
+                timeout_seconds=config.dbt_parse_timeout_seconds,
+                subprocess_runner=dbt_subprocess_runner,
+                which=which,
+            )
+
+            if dbt_parse_verdict.outcome == "failed":
+                last_gates = [
+                    allowlist_pass_gate,
+                    reaudit_pass_gate,
+                    fix_refuter_pass_gate,
+                    GateResult(name="dbt parse", outcome="fail", detail=dbt_parse_verdict.reason),
+                ]
+                last_reason = dbt_parse_verdict.reason
+                feedback = (
+                    f"round {round_num} was rejected by the dbt parse gate: "
+                    f"{dbt_parse_verdict.reason}"
+                )
+                continue
+
+            # The dbt parse gate is non-authoritative: a "skipped" outcome
+            # here is recorded honestly but never itself blocks or grants
+            # `proposed` -- only allowlist, re-audit, and fix-refuter are
+            # required, and all three already passed above.
+            dbt_parse_result_gate = GateResult(
+                name="dbt parse",
+                outcome="skipped" if dbt_parse_verdict.outcome == "skipped" else "pass",
+                detail=dbt_parse_verdict.reason,
+            )
+
             # Every required gate passed, this same round, for this same
             # candidate diff -- the only shape `proposed` may be reached by.
             last_gates = [
                 allowlist_pass_gate,
-                GateResult(name="re-audit", outcome="pass", detail=reaudit_verdict.reason),
+                reaudit_pass_gate,
+                fix_refuter_pass_gate,
+                dbt_parse_result_gate,
             ]
             return FixAttemptResult(
                 run_result=RunResult(

@@ -67,6 +67,38 @@ def _budget() -> ExecutionBudget:
     return ExecutionBudget(Bounds(max_turns=20))
 
 
+# --- default fakes for the two Sprint 4 gates --------------------------------
+#
+# Every existing (pre-Sprint-4) test in this file exercises only the
+# allowlist/re-audit gates; it neither needs nor wants a real fix-refuter
+# model call or a real `dbt` invocation. `_call` supplies deterministic,
+# always-non-blocking fakes for both by default (the fix-refuter gate always
+# gives an unambiguous "could not refute" pass, and `which` always reports no
+# `dbt` on PATH so the dbt parse gate always resolves to a harmless
+# "skipped") so those tests keep exercising exactly what they always have.
+# Tests that care about fix-refuter or dbt-parse behavior override these
+# explicitly.
+
+
+def _confident_refuter_pass(prompt: str) -> str:
+    return json.dumps({"refuted": False, "could_not_refute": True, "reason": "no flaw found"})
+
+
+def _no_dbt_on_path(name: str):
+    return None
+
+
+def _passing_dbt_subprocess_runner(argv, cwd, timeout_seconds) -> ProcessOutcome:
+    return ProcessOutcome(returncode=0, stdout="", stderr="")
+
+
+def _call(**kwargs):
+    kwargs.setdefault("refuter_runner", _confident_refuter_pass)
+    kwargs.setdefault("dbt_subprocess_runner", _passing_dbt_subprocess_runner)
+    kwargs.setdefault("which", _no_dbt_on_path)
+    return run_bounded_fix_attempt(**kwargs)
+
+
 def _whole_file_proposal(path: str, content: str) -> str:
     return json.dumps(
         {
@@ -119,7 +151,7 @@ def test_all_gates_passing_on_round_one_resolves_to_proposed(tmp_path: Path) -> 
     subprocess_runner = _RecordingSubprocessRunner(lambda n: ProcessOutcome(returncode=0, stdout=_PASSED_STDOUT))
 
     assert _no_leaked_scratch_dirs()
-    result = run_bounded_fix_attempt(
+    result = _call(
         config=_config(repo),
         target=_target(),
         fenced_context=_fenced_context(),
@@ -136,7 +168,12 @@ def test_all_gates_passing_on_round_one_resolves_to_proposed(tmp_path: Path) -> 
     assert result.diff is not None
     assert "where y = 1" in result.diff
     gate_names_outcomes = {g.name: g.outcome for g in result.run_result.gates}
-    assert gate_names_outcomes == {"allowlist": "pass", "re-audit": "pass"}
+    assert gate_names_outcomes == {
+        "allowlist": "pass",
+        "re-audit": "pass",
+        "fix-refuter": "pass",
+        "dbt parse": "skipped",
+    }
 
 
 # --- bounded by max_rounds -----------------------------------------------------
@@ -152,7 +189,7 @@ def test_retry_loop_is_bounded_by_max_rounds_when_allowlist_always_rejects(tmp_p
     subprocess_runner = _RecordingSubprocessRunner(lambda n: ProcessOutcome(returncode=0, stdout=_PASSED_STDOUT))
 
     assert _no_leaked_scratch_dirs()
-    result = run_bounded_fix_attempt(
+    result = _call(
         config=_config(repo, max_rounds=3),
         target=_target(),
         fenced_context=_fenced_context(),
@@ -169,7 +206,12 @@ def test_retry_loop_is_bounded_by_max_rounds_when_allowlist_always_rejects(tmp_p
     # The re-audit gate is never even reached once the allowlist rejects.
     assert len(subprocess_runner.calls) == 0
     gate_names_outcomes = {g.name: g.outcome for g in result.run_result.gates}
-    assert gate_names_outcomes == {"allowlist": "fail", "re-audit": "skipped"}
+    assert gate_names_outcomes == {
+        "allowlist": "fail",
+        "re-audit": "skipped",
+        "fix-refuter": "skipped",
+        "dbt parse": "skipped",
+    }
 
 
 def test_retry_loop_is_bounded_by_max_rounds_when_reaudit_always_blocks(tmp_path: Path) -> None:
@@ -179,7 +221,7 @@ def test_retry_loop_is_bounded_by_max_rounds_when_reaudit_always_blocks(tmp_path
     )
     subprocess_runner = _RecordingSubprocessRunner(lambda n: ProcessOutcome(returncode=0, stdout=_BLOCKED_STDOUT))
 
-    result = run_bounded_fix_attempt(
+    result = _call(
         config=_config(repo, max_rounds=2),
         target=_target(),
         fenced_context=_fenced_context(),
@@ -194,7 +236,12 @@ def test_retry_loop_is_bounded_by_max_rounds_when_reaudit_always_blocks(tmp_path
     assert len(model_runner.prompts) == 2
     assert len(subprocess_runner.calls) == 2
     gate_names_outcomes = {g.name: g.outcome for g in result.run_result.gates}
-    assert gate_names_outcomes == {"allowlist": "pass", "re-audit": "fail"}
+    assert gate_names_outcomes == {
+        "allowlist": "pass",
+        "re-audit": "fail",
+        "fix-refuter": "skipped",
+        "dbt parse": "skipped",
+    }
     assert result.diff is None
 
 
@@ -208,7 +255,7 @@ def test_rejected_round_feeds_its_specific_violation_back_as_feedback(tmp_path: 
     )
     subprocess_runner = _RecordingSubprocessRunner(lambda n: ProcessOutcome(returncode=0, stdout=_PASSED_STDOUT))
 
-    run_bounded_fix_attempt(
+    _call(
         config=_config(repo, max_rounds=2),
         target=_target(),
         fenced_context=_fenced_context(),
@@ -251,7 +298,7 @@ def test_proposed_only_reflects_the_round_that_actually_passed_every_gate(tmp_pa
     model_runner = _RecordingModelRunner(_propose)
     subprocess_runner = _RecordingSubprocessRunner(_auditor)
 
-    result = run_bounded_fix_attempt(
+    result = _call(
         config=_config(repo, max_rounds=3),
         target=_target(),
         fenced_context=_fenced_context(),
@@ -269,7 +316,140 @@ def test_proposed_only_reflects_the_round_that_actually_passed_every_gate(tmp_pa
     assert "where y = 3" in result.diff
     assert "where y = 2" not in result.diff
     gate_names_outcomes = {g.name: g.outcome for g in result.run_result.gates}
-    assert gate_names_outcomes == {"allowlist": "pass", "re-audit": "pass"}
+    assert gate_names_outcomes == {
+        "allowlist": "pass",
+        "re-audit": "pass",
+        "fix-refuter": "pass",
+        "dbt parse": "skipped",
+    }
+
+
+# --- fix-refuter gate wiring ---------------------------------------------------
+
+
+def test_fix_refuter_rejection_is_bounded_by_max_rounds_and_never_reaches_dbt_parse(
+    tmp_path: Path,
+) -> None:
+    repo = _make_repo(tmp_path)
+    model_runner = _RecordingModelRunner(
+        lambda n: _whole_file_proposal("models/a.sql", f"select 1\nfrom x\nwhere y = {n}\n")
+    )
+    subprocess_runner = _RecordingSubprocessRunner(lambda n: ProcessOutcome(returncode=0, stdout=_PASSED_STDOUT))
+    dbt_subprocess_runner = _passing_dbt_subprocess_runner
+    dbt_calls: List[dict] = []
+
+    def _recording_dbt_subprocess_runner(argv, cwd, timeout_seconds):
+        dbt_calls.append({"argv": list(argv), "cwd": cwd, "timeout": timeout_seconds})
+        return dbt_subprocess_runner(argv, cwd, timeout_seconds)
+
+    def _always_refutes(prompt: str) -> str:
+        return json.dumps(
+            {"refuted": True, "could_not_refute": False, "reason": "this diff is a no-op"}
+        )
+
+    result = _call(
+        config=_config(repo, max_rounds=2),
+        target=_target(),
+        fenced_context=_fenced_context(),
+        repo_root=repo,
+        model_runner=model_runner,
+        subprocess_runner=subprocess_runner,
+        refuter_runner=_always_refutes,
+        dbt_subprocess_runner=_recording_dbt_subprocess_runner,
+        budget=_budget(),
+    )
+
+    assert result.run_result.status == "no_safe_fix"
+    assert result.rounds_used == 2
+    assert result.diff is None
+    # The dbt parse gate is never even reached once the fix-refuter rejects.
+    assert dbt_calls == []
+    gate_names_outcomes = {g.name: g.outcome for g in result.run_result.gates}
+    assert gate_names_outcomes == {
+        "allowlist": "pass",
+        "re-audit": "pass",
+        "fix-refuter": "fail",
+        "dbt parse": "skipped",
+    }
+    assert "this diff is a no-op" in result.run_result.reason
+
+
+def test_fix_refuter_passing_lets_the_round_reach_the_dbt_parse_gate(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    model_runner = _RecordingModelRunner(
+        lambda n: _whole_file_proposal("models/a.sql", "select 1\nfrom x\nwhere y = 1\n")
+    )
+    subprocess_runner = _RecordingSubprocessRunner(lambda n: ProcessOutcome(returncode=0, stdout=_PASSED_STDOUT))
+    dbt_calls: List[dict] = []
+
+    def _fake_which(name: str):
+        return "/usr/local/bin/dbt" if name == "dbt" else None
+
+    def _recording_dbt_subprocess_runner(argv, cwd, timeout_seconds):
+        dbt_calls.append({"argv": list(argv), "cwd": cwd, "timeout": timeout_seconds})
+        return ProcessOutcome(returncode=0, stdout="", stderr="")
+
+    result = _call(
+        config=_config(repo),
+        target=_target(),
+        fenced_context=_fenced_context(),
+        repo_root=repo,
+        model_runner=model_runner,
+        subprocess_runner=subprocess_runner,
+        dbt_subprocess_runner=_recording_dbt_subprocess_runner,
+        which=_fake_which,
+        budget=_budget(),
+    )
+
+    assert result.run_result.status == "proposed"
+    assert len(dbt_calls) == 1
+    gate_names_outcomes = {g.name: g.outcome for g in result.run_result.gates}
+    assert gate_names_outcomes == {
+        "allowlist": "pass",
+        "re-audit": "pass",
+        "fix-refuter": "pass",
+        "dbt parse": "pass",
+    }
+
+
+def test_dbt_parse_gate_failure_rejects_the_round_but_stays_non_authoritative_on_skip(
+    tmp_path: Path,
+) -> None:
+    repo = _make_repo(tmp_path)
+    model_runner = _RecordingModelRunner(
+        lambda n: _whole_file_proposal("models/a.sql", f"select 1\nfrom x\nwhere y = {n}\n")
+    )
+    subprocess_runner = _RecordingSubprocessRunner(lambda n: ProcessOutcome(returncode=0, stdout=_PASSED_STDOUT))
+
+    def _fake_which(name: str):
+        return "/usr/local/bin/dbt" if name == "dbt" else None
+
+    def _failing_dbt_subprocess_runner(argv, cwd, timeout_seconds):
+        return ProcessOutcome(returncode=1, stdout="", stderr="Compilation Error: bad ref()")
+
+    result = _call(
+        config=_config(repo, max_rounds=2),
+        target=_target(),
+        fenced_context=_fenced_context(),
+        repo_root=repo,
+        model_runner=model_runner,
+        subprocess_runner=subprocess_runner,
+        dbt_subprocess_runner=_failing_dbt_subprocess_runner,
+        which=_fake_which,
+        budget=_budget(),
+    )
+
+    assert result.run_result.status == "no_safe_fix"
+    assert result.rounds_used == 2
+    assert result.diff is None
+    gate_names_outcomes = {g.name: g.outcome for g in result.run_result.gates}
+    assert gate_names_outcomes == {
+        "allowlist": "pass",
+        "re-audit": "pass",
+        "fix-refuter": "pass",
+        "dbt parse": "fail",
+    }
+    assert "bad ref" in result.run_result.reason
 
 
 # --- distinct failed vs. no_safe_fix semantics --------------------------------
@@ -282,7 +462,7 @@ def test_missing_auditor_interpreter_is_no_safe_fix_and_stops_immediately(tmp_pa
     )
     subprocess_runner = _RecordingSubprocessRunner(lambda n: ProcessOutcome(returncode=0, stdout=_PASSED_STDOUT))
 
-    result = run_bounded_fix_attempt(
+    result = _call(
         config=_config(repo, max_rounds=5, auditor_python=None),
         target=_target(),
         fenced_context=_fenced_context(),
@@ -310,7 +490,7 @@ def test_unexpected_exception_in_a_gate_resolves_to_failed_not_no_safe_fix(tmp_p
         raise RuntimeError("simulated bug in the allowlist gate")
 
     assert _no_leaked_scratch_dirs()
-    result = run_bounded_fix_attempt(
+    result = _call(
         config=_config(repo, max_rounds=3),
         target=_target(),
         fenced_context=_fenced_context(),
@@ -335,7 +515,7 @@ def test_failed_and_no_safe_fix_are_never_the_same_status(tmp_path: Path) -> Non
         lambda n: _whole_file_proposal("dbt_project.yml", f"name: test\nversion: {n}\n")
     )
     subprocess_runner_a = _RecordingSubprocessRunner(lambda n: ProcessOutcome(returncode=0, stdout=_PASSED_STDOUT))
-    result_a = run_bounded_fix_attempt(
+    result_a = _call(
         config=_config(repo, max_rounds=2),
         target=_target(),
         fenced_context=_fenced_context(),
@@ -354,7 +534,7 @@ def test_failed_and_no_safe_fix_are_never_the_same_status(tmp_path: Path) -> Non
     def _broken_reaudit_gate(**kwargs):
         raise ValueError("boom")
 
-    result_b = run_bounded_fix_attempt(
+    result_b = _call(
         config=_config(repo, max_rounds=2),
         target=_target(),
         fenced_context=_fenced_context(),
@@ -424,7 +604,7 @@ def test_scratch_dirs_never_leak_regardless_of_terminal_outcome(tmp_path: Path, 
     )
     if allowlist_gate is not None:
         kwargs["allowlist_gate"] = allowlist_gate
-    result = run_bounded_fix_attempt(**kwargs)
+    result = _call(**kwargs)
     assert _no_leaked_scratch_dirs()
 
     expected_status = {
