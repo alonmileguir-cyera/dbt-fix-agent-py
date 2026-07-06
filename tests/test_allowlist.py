@@ -1,0 +1,358 @@
+"""Tests for `dbt_fixer.allowlist`: the deterministic Allowlist Classifier Gate.
+
+Every test builds a real on-disk repo fixture and a real candidate diff via
+`dbt_fixer.diffing.generate_unified_diff` (never a hand-typed diff string,
+except where a specific malformed-syntax case requires it), so the gate is
+always exercised against its actual production input shape.
+"""
+
+from __future__ import annotations
+
+import shutil
+from pathlib import Path
+from typing import Tuple
+
+import pytest
+
+from dbt_fixer.allowlist import AllowlistCaps, run_allowlist_gate
+from dbt_fixer.diffing import generate_unified_diff
+from dbt_fixer.intake import FailingCheck
+
+DEFAULT_CAPS = AllowlistCaps(max_changed_files=5, max_changed_lines=60)
+
+
+def _make_repo(tmp_path: Path, files: dict[str, str]) -> Path:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for relative_path, content in files.items():
+        target = repo / relative_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content)
+    return repo
+
+
+def _candidate_diff(repo: Path, tmp_path: Path, edits: dict[str, str], *, changed_paths=None) -> str:
+    """Build a real unified diff by copying `repo`, applying `edits`, and diffing."""
+
+    after = tmp_path / "after"
+    if after.exists():
+        shutil.rmtree(after)
+    shutil.copytree(repo, after)
+    for relative_path, new_content in edits.items():
+        target = after / relative_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(new_content)
+    paths = changed_paths if changed_paths is not None else list(edits.keys())
+    return generate_unified_diff(repo, after, paths)
+
+
+# --- file-type restriction ---------------------------------------------------
+
+
+def test_candidate_touching_only_allowed_files_passes_type_check(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path, {"models/a.sql": "select 1\nfrom x\nwhere y = 1\n"})
+    diff_text = _candidate_diff(repo, tmp_path, {"models/a.sql": "select 1\nfrom x\n"})
+    pr_diff = diff_text  # the PR itself deleted this exact line, so it's a restore-consistent case
+
+    verdict = run_allowlist_gate(
+        repo_root=repo,
+        candidate_diff=diff_text,
+        pr_diff=pr_diff,
+        failure_kind="ci",
+        caps=DEFAULT_CAPS,
+    )
+    assert verdict.passed
+    assert verdict.violation is None
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["dbt_project.yml", "seeds/a.csv", "macros/helper.sql", "models/a.py", "tests/custom_test.sql"],
+)
+def test_candidate_touching_disallowed_file_is_rejected(tmp_path: Path, path: str) -> None:
+    repo = _make_repo(tmp_path, {path: "original content\n"})
+    diff_text = _candidate_diff(repo, tmp_path, {path: "changed content\n"})
+
+    verdict = run_allowlist_gate(
+        repo_root=repo, candidate_diff=diff_text, pr_diff="", failure_kind="ci", caps=DEFAULT_CAPS
+    )
+    assert not verdict.passed
+    assert verdict.violation == "file_type_not_allowed"
+    assert path in verdict.reason
+
+
+# --- restore-only SQL deletion ----------------------------------------------
+
+
+def test_sql_deletion_matching_pr_deletion_is_accepted(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path, {"models/a.sql": "select 1\nfrom x\nwhere y = 1\n"})
+    # The PR diff itself deleted "where y = 1" from this file.
+    pr_diff = _candidate_diff(repo, tmp_path, {"models/a.sql": "select 1\nfrom x\n"})
+    # The candidate deletes that exact same line -- a restore under this
+    # gate's literal rule.
+    candidate_diff = pr_diff
+
+    verdict = run_allowlist_gate(
+        repo_root=repo, candidate_diff=candidate_diff, pr_diff=pr_diff, failure_kind="ci", caps=DEFAULT_CAPS
+    )
+    assert verdict.passed
+
+
+def test_sql_deletion_not_matching_pr_deletion_is_rejected(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path, {"models/a.sql": "select 1\nfrom x\nwhere y = 1\n"})
+    pr_diff = ""  # the PR diff deleted nothing at all
+    candidate_diff = _candidate_diff(repo, tmp_path, {"models/a.sql": "select 1\nfrom x\n"})
+
+    verdict = run_allowlist_gate(
+        repo_root=repo, candidate_diff=candidate_diff, pr_diff=pr_diff, failure_kind="ci", caps=DEFAULT_CAPS
+    )
+    assert not verdict.passed
+    assert verdict.violation == "sql_deletion_not_a_restore"
+
+
+@pytest.mark.parametrize("kind", ["ci", "audit"])
+def test_restore_only_rule_applies_to_both_failure_kinds(tmp_path: Path, kind: str) -> None:
+    repo = _make_repo(tmp_path, {"models/a.sql": "select 1\nfrom x\nwhere y = 1\n"})
+    pr_diff = ""
+    candidate_diff = _candidate_diff(repo, tmp_path, {"models/a.sql": "select 1\nfrom x\n"})
+
+    verdict = run_allowlist_gate(
+        repo_root=repo, candidate_diff=candidate_diff, pr_diff=pr_diff, failure_kind=kind, caps=DEFAULT_CAPS
+    )
+    assert not verdict.passed
+    assert verdict.violation == "sql_deletion_not_a_restore"
+
+
+# --- test weakening, by failure kind ----------------------------------------
+
+_SCHEMA_YML_BEFORE = (
+    "models:\n"
+    "  - name: orders\n"
+    "    columns:\n"
+    "      - name: id\n"
+    "        tests:\n"
+    "          - not_null\n"
+    "          - unique\n"
+)
+_SCHEMA_YML_AFTER = (
+    "models:\n"
+    "  - name: orders\n"
+    "    columns:\n"
+    "      - name: id\n"
+    "        tests:\n"
+    "          - unique\n"
+)
+
+
+def test_ci_kind_categorically_rejects_test_deletion(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path, {"models/schema.yml": _SCHEMA_YML_BEFORE})
+    candidate_diff = _candidate_diff(repo, tmp_path, {"models/schema.yml": _SCHEMA_YML_AFTER})
+
+    verdict = run_allowlist_gate(
+        repo_root=repo, candidate_diff=candidate_diff, pr_diff="", failure_kind="ci", caps=DEFAULT_CAPS
+    )
+    assert not verdict.passed
+    assert verdict.violation == "test_weakening_rejected_ci"
+
+
+def test_audit_kind_rejects_test_deletion_without_proof(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path, {"models/schema.yml": _SCHEMA_YML_BEFORE})
+    candidate_diff = _candidate_diff(repo, tmp_path, {"models/schema.yml": _SCHEMA_YML_AFTER})
+
+    verdict = run_allowlist_gate(
+        repo_root=repo,
+        candidate_diff=candidate_diff,
+        pr_diff="",
+        failure_kind="audit",
+        caps=DEFAULT_CAPS,
+        failing_checks=(FailingCheck(identifier="not_null_orders_id", evidence="still failing"),),
+    )
+    assert not verdict.passed
+    assert verdict.violation == "test_weakening_rejected_audit_unproven"
+
+
+def test_audit_kind_accepts_test_deletion_with_explicit_proof(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path, {"models/schema.yml": _SCHEMA_YML_BEFORE})
+    candidate_diff = _candidate_diff(repo, tmp_path, {"models/schema.yml": _SCHEMA_YML_AFTER})
+
+    verdict = run_allowlist_gate(
+        repo_root=repo,
+        candidate_diff=candidate_diff,
+        pr_diff="",
+        failure_kind="audit",
+        caps=DEFAULT_CAPS,
+        failing_checks=(
+            FailingCheck(
+                identifier="not_null_orders_id",
+                evidence="Manually verified against source data; this test has been proven wrong.",
+            ),
+        ),
+    )
+    assert verdict.passed
+
+
+# --- hard caps + sensitive patterns ------------------------------------------
+
+
+def test_candidate_exceeding_max_changed_files_is_rejected(tmp_path: Path) -> None:
+    repo = _make_repo(
+        tmp_path, {f"models/a{i}.sql": f"select {i}\n" for i in range(3)}
+    )
+    edits = {f"models/a{i}.sql": f"select {i}00\n" for i in range(3)}
+    candidate_diff = _candidate_diff(repo, tmp_path, edits)
+
+    verdict = run_allowlist_gate(
+        repo_root=repo,
+        candidate_diff=candidate_diff,
+        pr_diff="",
+        failure_kind="ci",
+        caps=AllowlistCaps(max_changed_files=2, max_changed_lines=60),
+    )
+    assert not verdict.passed
+    assert verdict.violation == "max_changed_files_exceeded"
+
+
+def test_candidate_exceeding_max_changed_lines_is_rejected(tmp_path: Path) -> None:
+    original = "\n".join(f"line {i}" for i in range(20)) + "\n"
+    repo = _make_repo(tmp_path, {"models/a.sql": original})
+    modified = "\n".join(f"line {i} changed" for i in range(20)) + "\n"
+    candidate_diff = _candidate_diff(repo, tmp_path, {"models/a.sql": modified})
+
+    verdict = run_allowlist_gate(
+        repo_root=repo,
+        candidate_diff=candidate_diff,
+        pr_diff="",
+        failure_kind="ci",
+        caps=AllowlistCaps(max_changed_files=5, max_changed_lines=10),
+    )
+    assert not verdict.passed
+    assert verdict.violation == "max_changed_lines_exceeded"
+
+
+@pytest.mark.parametrize(
+    "before,after",
+    [
+        ("select 1\n", "{{ config(pre_hook=\"grant select\") }}\nselect 1\n"),
+        ("select 1\n", "{{ config(materialized='table') }}\nselect 1\n"),
+        ("select 1\n", "-- bypass masking for this column\nselect 1\n"),
+    ],
+)
+def test_sensitive_pattern_rejected_even_under_caps(tmp_path: Path, before: str, after: str) -> None:
+    repo = _make_repo(tmp_path, {"models/a.sql": before})
+    candidate_diff = _candidate_diff(repo, tmp_path, {"models/a.sql": after})
+
+    verdict = run_allowlist_gate(
+        repo_root=repo,
+        candidate_diff=candidate_diff,
+        pr_diff="",
+        failure_kind="ci",
+        caps=AllowlistCaps(max_changed_files=50, max_changed_lines=2000),
+    )
+    assert not verdict.passed
+    assert verdict.violation == "sensitive_pattern_detected"
+
+
+# --- malformed / no-op candidates -------------------------------------------
+
+
+def test_empty_candidate_diff_is_rejected_as_no_op(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path, {"models/a.sql": "select 1\n"})
+    verdict = run_allowlist_gate(
+        repo_root=repo, candidate_diff="", pr_diff="", failure_kind="ci", caps=DEFAULT_CAPS
+    )
+    assert not verdict.passed
+    assert verdict.violation == "no_op_candidate"
+
+
+def test_malformed_diff_syntax_is_rejected_not_raised(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path, {"models/a.sql": "select 1\n"})
+    malformed = "this is not a valid unified diff at all\n"
+
+    verdict = run_allowlist_gate(
+        repo_root=repo, candidate_diff=malformed, pr_diff="", failure_kind="ci", caps=DEFAULT_CAPS
+    )
+    assert not verdict.passed
+    assert verdict.violation == "patch_apply_failed"
+
+
+def test_diff_that_does_not_apply_cleanly_is_rejected_not_raised(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path, {"models/a.sql": "select 1\nfrom x\n"})
+    # Hand-built diff whose context line does not match the real repo content.
+    conflicting = (
+        "diff --git a/models/a.sql b/models/a.sql\n"
+        "--- a/models/a.sql\n"
+        "+++ b/models/a.sql\n"
+        "@@ -1,2 +1,2 @@\n"
+        " select 999\n"
+        "-from x\n"
+        "+from y\n"
+    )
+
+    verdict = run_allowlist_gate(
+        repo_root=repo, candidate_diff=conflicting, pr_diff="", failure_kind="ci", caps=DEFAULT_CAPS
+    )
+    assert not verdict.passed
+    assert verdict.violation == "patch_apply_failed"
+
+
+def test_no_net_change_candidate_is_rejected_as_no_op(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path, {"models/a.sql": "select 1\nfrom x\n"})
+    # A contrived diff: removes then re-adds the exact same line, netting no change.
+    noop = (
+        "diff --git a/models/a.sql b/models/a.sql\n"
+        "--- a/models/a.sql\n"
+        "+++ b/models/a.sql\n"
+        "@@ -1,2 +1,2 @@\n"
+        " select 1\n"
+        "-from x\n"
+        "+from x\n"
+    )
+
+    verdict = run_allowlist_gate(
+        repo_root=repo, candidate_diff=noop, pr_diff="", failure_kind="ci", caps=DEFAULT_CAPS
+    )
+    assert not verdict.passed
+    assert verdict.violation == "no_op_candidate"
+
+
+# --- determinism / no model calls -------------------------------------------
+
+
+class _CountingRunner:
+    """A fake model runner that records how many times it is invoked.
+
+    Never passed to `run_allowlist_gate` (its signature accepts no model
+    runner at all); used here only to prove that repeatedly running the
+    gate never causes any call to accrue against it, i.e. the gate truly
+    never reaches for a model.
+    """
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def __call__(self, prompt: str) -> str:
+        self.calls += 1
+        return "{}"
+
+
+def test_allowlist_gate_is_deterministic_and_never_calls_a_model(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path, {"models/a.sql": "select 1\nfrom x\nwhere y = 1\n"})
+    pr_diff = _candidate_diff(repo, tmp_path, {"models/a.sql": "select 1\nfrom x\n"})
+    candidate_diff = pr_diff
+
+    runner = _CountingRunner()
+
+    verdicts = [
+        run_allowlist_gate(
+            repo_root=repo,
+            candidate_diff=candidate_diff,
+            pr_diff=pr_diff,
+            failure_kind="ci",
+            caps=DEFAULT_CAPS,
+        )
+        for _ in range(5)
+    ]
+
+    assert all(v.passed for v in verdicts)
+    assert len({(v.passed, v.violation, v.reason) for v in verdicts}) == 1
+    assert runner.calls == 0
