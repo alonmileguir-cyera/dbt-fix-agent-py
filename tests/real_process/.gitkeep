@@ -1,0 +1,6 @@
+This directory is reserved for the explicitly-marked real-process integration
+test module (real `dbt`, the real auditor subprocess, etc.), added starting in
+Sprint 4/5. Every test module placed here must mark its tests with
+`@pytest.mark.real_process` so `tests/conftest.py`'s offline-network/subprocess
+guard exempts them. Sprint 1 has no real-process tests; this placeholder keeps
+the directory (and the convention) present from the start.

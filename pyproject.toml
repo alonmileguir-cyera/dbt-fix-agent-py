@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dbt-fixer"
+version = "0.1.0"
+description = "Shadow-mode dbt Fix Agent: proposes narrowly-scoped, mechanically-gated repairs for known-red dbt Cloud CI failures and auditor-blocked PRs. Never writes to GitHub."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+authors = [{ name = "Cyera BI/Analytics Engineering" }]
+
+dependencies = [
+    "agno==2.6.11",
+    "boto3>=1.34,<2.0",
+    "slack_sdk>=3.27,<4.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0,<9.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "real_process: allows real subprocess/network access in this test module (exempt from the offline-only conftest guard).",
+]
