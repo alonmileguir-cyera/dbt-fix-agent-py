@@ -28,6 +28,8 @@ Environment-contract table (this module's slice of it):
 | `DBT_FIXER_MAX_CHANGED_FILES`  | no       | `5`                 | non-numeric/out-of-`[1, 50]` -> falls back to `5`, records a warning |
 | `DBT_FIXER_MAX_CHANGED_LINES`  | no       | `60`                | non-numeric/out-of-`[1, 2000]` -> falls back to `60`, records a warning |
 | `DBT_FIXER_REAUDIT_TIMEOUT_SECONDS` | no  | `120`               | non-numeric/out-of-`[1, 1800]` -> falls back to `120`, records a warning |
+| `DBT_FIXER_REFUTER_TIMEOUT_SECONDS` | no  | `60`                | non-numeric/out-of-`[1, 600]` -> falls back to `60`, records a warning |
+| `DBT_FIXER_DBT_PARSE_TIMEOUT_SECONDS` | no | `30`               | non-numeric/out-of-`[1, 300]` -> falls back to `30`, records a warning |
 
 `FixerConfig.warnings` carries every fallback-to-default explanation so a
 malformed value is never silently substituted -- it is always at least
@@ -58,6 +60,12 @@ _MAX_CHANGED_LINES_RANGE = (1, 2000)
 DEFAULT_REAUDIT_TIMEOUT_SECONDS = 120
 _REAUDIT_TIMEOUT_SECONDS_RANGE = (1, 1800)
 
+DEFAULT_REFUTER_TIMEOUT_SECONDS = 60
+_REFUTER_TIMEOUT_SECONDS_RANGE = (1, 600)
+
+DEFAULT_DBT_PARSE_TIMEOUT_SECONDS = 30
+_DBT_PARSE_TIMEOUT_SECONDS_RANGE = (1, 300)
+
 ENV_FAILURE_KIND = "DBT_FIXER_FAILURE_KIND"
 ENV_REPO_PATH = "DBT_FIXER_REPO_PATH"
 ENV_PR_TITLE = "DBT_FIXER_PR_TITLE"
@@ -71,6 +79,8 @@ ENV_MAX_ROUNDS = "DBT_FIXER_MAX_ROUNDS"
 ENV_MAX_CHANGED_FILES = "DBT_FIXER_MAX_CHANGED_FILES"
 ENV_MAX_CHANGED_LINES = "DBT_FIXER_MAX_CHANGED_LINES"
 ENV_REAUDIT_TIMEOUT_SECONDS = "DBT_FIXER_REAUDIT_TIMEOUT_SECONDS"
+ENV_REFUTER_TIMEOUT_SECONDS = "DBT_FIXER_REFUTER_TIMEOUT_SECONDS"
+ENV_DBT_PARSE_TIMEOUT_SECONDS = "DBT_FIXER_DBT_PARSE_TIMEOUT_SECONDS"
 
 
 class EnvValidationError(ValueError):
@@ -99,6 +109,8 @@ class FixerConfig:
     max_changed_files: int = DEFAULT_MAX_CHANGED_FILES
     max_changed_lines: int = DEFAULT_MAX_CHANGED_LINES
     reaudit_timeout_seconds: float = DEFAULT_REAUDIT_TIMEOUT_SECONDS
+    refuter_timeout_seconds: float = DEFAULT_REFUTER_TIMEOUT_SECONDS
+    dbt_parse_timeout_seconds: float = DEFAULT_DBT_PARSE_TIMEOUT_SECONDS
 
     warnings: tuple[str, ...] = field(default_factory=tuple)
 
@@ -158,6 +170,30 @@ def _parse_reaudit_timeout_seconds(env: Mapping[str, str], warnings: list[str]) 
     )
 
 
+def _parse_refuter_timeout_seconds(env: Mapping[str, str], warnings: list[str]) -> float:
+    return parse_bounded_number(
+        env,
+        ENV_REFUTER_TIMEOUT_SECONDS,
+        default=DEFAULT_REFUTER_TIMEOUT_SECONDS,
+        min_value=_REFUTER_TIMEOUT_SECONDS_RANGE[0],
+        max_value=_REFUTER_TIMEOUT_SECONDS_RANGE[1],
+        warnings=warnings,
+        caster=float,
+    )
+
+
+def _parse_dbt_parse_timeout_seconds(env: Mapping[str, str], warnings: list[str]) -> float:
+    return parse_bounded_number(
+        env,
+        ENV_DBT_PARSE_TIMEOUT_SECONDS,
+        default=DEFAULT_DBT_PARSE_TIMEOUT_SECONDS,
+        min_value=_DBT_PARSE_TIMEOUT_SECONDS_RANGE[0],
+        max_value=_DBT_PARSE_TIMEOUT_SECONDS_RANGE[1],
+        warnings=warnings,
+        caster=float,
+    )
+
+
 def load_config(env: Optional[Mapping[str, str]] = None) -> FixerConfig:
     """Parse and validate the `DBT_FIXER_*` environment contract.
 
@@ -188,6 +224,8 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> FixerConfig:
     max_changed_files = _parse_max_changed_files(env, warnings)
     max_changed_lines = _parse_max_changed_lines(env, warnings)
     reaudit_timeout_seconds = _parse_reaudit_timeout_seconds(env, warnings)
+    refuter_timeout_seconds = _parse_refuter_timeout_seconds(env, warnings)
+    dbt_parse_timeout_seconds = _parse_dbt_parse_timeout_seconds(env, warnings)
 
     slack_channel = env.get(ENV_SLACK_CHANNEL) or None
     auditor_python = env.get(ENV_AUDITOR_PYTHON) or None
@@ -206,5 +244,7 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> FixerConfig:
         max_changed_files=max_changed_files,
         max_changed_lines=max_changed_lines,
         reaudit_timeout_seconds=reaudit_timeout_seconds,
+        refuter_timeout_seconds=refuter_timeout_seconds,
+        dbt_parse_timeout_seconds=dbt_parse_timeout_seconds,
         warnings=tuple(warnings),
     )

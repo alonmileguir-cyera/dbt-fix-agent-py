@@ -5,11 +5,14 @@ from __future__ import annotations
 import pytest
 
 from dbt_fixer.env import (
+    DEFAULT_DBT_PARSE_TIMEOUT_SECONDS,
     DEFAULT_MAX_CHANGED_FILES,
     DEFAULT_MAX_CHANGED_LINES,
     DEFAULT_MAX_ROUNDS,
     DEFAULT_REAUDIT_TIMEOUT_SECONDS,
+    DEFAULT_REFUTER_TIMEOUT_SECONDS,
     ENV_AUDITOR_PYTHON,
+    ENV_DBT_PARSE_TIMEOUT_SECONDS,
     ENV_FAILURE_KIND,
     ENV_MAX_CHANGED_FILES,
     ENV_MAX_CHANGED_LINES,
@@ -19,6 +22,7 @@ from dbt_fixer.env import (
     ENV_PR_TITLE,
     ENV_PR_URL,
     ENV_REAUDIT_TIMEOUT_SECONDS,
+    ENV_REFUTER_TIMEOUT_SECONDS,
     ENV_REPO_PATH,
     ENV_SLACK_CHANNEL,
     EnvValidationError,
@@ -85,6 +89,8 @@ def test_all_optional_fields_default_when_unset(tmp_path):
     assert config.max_changed_files == DEFAULT_MAX_CHANGED_FILES
     assert config.max_changed_lines == DEFAULT_MAX_CHANGED_LINES
     assert config.reaudit_timeout_seconds == DEFAULT_REAUDIT_TIMEOUT_SECONDS
+    assert config.refuter_timeout_seconds == DEFAULT_REFUTER_TIMEOUT_SECONDS
+    assert config.dbt_parse_timeout_seconds == DEFAULT_DBT_PARSE_TIMEOUT_SECONDS
     assert config.warnings == ()
 
 
@@ -102,6 +108,8 @@ def test_optional_fields_are_respected_when_set(tmp_path):
             ENV_MAX_CHANGED_FILES: "10",
             ENV_MAX_CHANGED_LINES: "200",
             ENV_REAUDIT_TIMEOUT_SECONDS: "30",
+            ENV_REFUTER_TIMEOUT_SECONDS: "45",
+            ENV_DBT_PARSE_TIMEOUT_SECONDS: "15",
         },
     )
     config = load_config(env)
@@ -115,6 +123,8 @@ def test_optional_fields_are_respected_when_set(tmp_path):
     assert config.max_changed_files == 10
     assert config.max_changed_lines == 200
     assert config.reaudit_timeout_seconds == 30
+    assert config.refuter_timeout_seconds == 45
+    assert config.dbt_parse_timeout_seconds == 15
 
 
 @pytest.mark.parametrize("bad_value", ["not-a-number", "-1", "0", "999", "3.5"])
@@ -186,6 +196,42 @@ def test_valid_reaudit_timeout_seconds_at_and_within_boundaries_is_respected(
     env = _base_env(tmp_path, **{ENV_REAUDIT_TIMEOUT_SECONDS: good_value})
     config = load_config(env)
     assert config.reaudit_timeout_seconds == expected
+    assert config.warnings == ()
+
+
+@pytest.mark.parametrize("bad_value", ["not-a-number", "-1", "0", "9999", "nan", "inf"])
+def test_malformed_refuter_timeout_seconds_falls_back_to_default(tmp_path, bad_value):
+    env = _base_env(tmp_path, **{ENV_REFUTER_TIMEOUT_SECONDS: bad_value})
+    config = load_config(env)
+    assert config.refuter_timeout_seconds == DEFAULT_REFUTER_TIMEOUT_SECONDS
+    assert any(ENV_REFUTER_TIMEOUT_SECONDS in w for w in config.warnings)
+
+
+@pytest.mark.parametrize("good_value,expected", [("1", 1), ("600", 600), ("60", 60)])
+def test_valid_refuter_timeout_seconds_at_and_within_boundaries_is_respected(
+    tmp_path, good_value, expected
+):
+    env = _base_env(tmp_path, **{ENV_REFUTER_TIMEOUT_SECONDS: good_value})
+    config = load_config(env)
+    assert config.refuter_timeout_seconds == expected
+    assert config.warnings == ()
+
+
+@pytest.mark.parametrize("bad_value", ["not-a-number", "-1", "0", "9999", "nan", "inf"])
+def test_malformed_dbt_parse_timeout_seconds_falls_back_to_default(tmp_path, bad_value):
+    env = _base_env(tmp_path, **{ENV_DBT_PARSE_TIMEOUT_SECONDS: bad_value})
+    config = load_config(env)
+    assert config.dbt_parse_timeout_seconds == DEFAULT_DBT_PARSE_TIMEOUT_SECONDS
+    assert any(ENV_DBT_PARSE_TIMEOUT_SECONDS in w for w in config.warnings)
+
+
+@pytest.mark.parametrize("good_value,expected", [("1", 1), ("300", 300), ("30", 30)])
+def test_valid_dbt_parse_timeout_seconds_at_and_within_boundaries_is_respected(
+    tmp_path, good_value, expected
+):
+    env = _base_env(tmp_path, **{ENV_DBT_PARSE_TIMEOUT_SECONDS: good_value})
+    config = load_config(env)
+    assert config.dbt_parse_timeout_seconds == expected
     assert config.warnings == ()
 
 
