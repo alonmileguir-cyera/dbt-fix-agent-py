@@ -139,11 +139,19 @@ def _sensitive_pattern_hit(text: str) -> Optional[str]:
 def _check_file_types(blocks: Tuple[FileDiffBlock, ...]) -> Optional[AllowlistVerdict]:
     for block in blocks:
         path = Path(block.path)
-        if not block.path.startswith(ALLOWED_PATH_PREFIX):
+        # bi-dbt is a multi-project repo: model files live under
+        # <project>/models/... (bi-dbt-us/models/, bi-dbt-multiregion/models/,
+        # ...), not a repo-root models/. The containment rule is therefore
+        # "has a models/ path segment", not "starts with models/". A bare
+        # repo-root models/ layout still satisfies it.
+        if "models" not in path.parts[:-1]:
             return AllowlistVerdict(
                 passed=False,
                 violation="file_type_not_allowed",
-                reason=f"{block.path!r} is not under {ALLOWED_PATH_PREFIX!r}",
+                reason=(
+                    f"{block.path!r} has no models/ path segment - only files "
+                    "inside a dbt project's models/ tree may be touched"
+                ),
             )
         if path.suffix.lower() not in ALLOWED_EXTENSIONS:
             return AllowlistVerdict(

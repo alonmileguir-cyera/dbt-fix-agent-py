@@ -356,3 +356,37 @@ def test_allowlist_gate_is_deterministic_and_never_calls_a_model(tmp_path: Path)
     assert all(v.passed for v in verdicts)
     assert len({(v.passed, v.violation, v.reason) for v in verdicts}) == 1
     assert runner.calls == 0
+
+
+def test_multi_project_models_paths_are_allowed():
+    """bi-dbt layout: <project>/models/... must pass the path rule."""
+    from dbt_fixer.allowlist import _check_file_types  # type: ignore[attr-defined]
+    from dbt_fixer.diffparse import parse_diff
+
+    diff = (
+        "diff --git a/bi-dbt-multiregion/models/staging/x/_m.yml b/bi-dbt-multiregion/models/staging/x/_m.yml\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/bi-dbt-multiregion/models/staging/x/_m.yml\n"
+        "@@ -0,0 +1 @@\n"
+        "+version: 2\n"
+    )
+    blocks = parse_diff(diff)
+    assert _check_file_types(blocks) is None  # no violation
+
+
+def test_paths_outside_any_models_tree_still_rejected():
+    from dbt_fixer.allowlist import _check_file_types  # type: ignore[attr-defined]
+    from dbt_fixer.diffparse import parse_diff
+
+    diff = (
+        "diff --git a/macros/evil.yml b/macros/evil.yml\n"
+        "--- a/macros/evil.yml\n"
+        "+++ b/macros/evil.yml\n"
+        "@@ -1 +1 @@\n"
+        "-a\n"
+        "+b\n"
+    )
+    blocks = parse_diff(diff)
+    verdict = _check_file_types(blocks)
+    assert verdict is not None and not verdict.passed
