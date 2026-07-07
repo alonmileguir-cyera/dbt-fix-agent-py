@@ -409,3 +409,50 @@ def test_build_proposal_prompt_includes_preloaded_section_when_present():
     without = build_proposal_prompt(fenced, None, None)
     assert "pre-loaded for you" in with_pre
     assert "pre-loaded for you" not in without  # byte-identical to pre-seed-free path
+
+
+# ---------------------------------------------------------------------------
+# create_file edit kind + honest-declination detection
+# ---------------------------------------------------------------------------
+
+
+def _proposal_json(edits):
+    import json
+    return json.dumps({"edits": edits, "rationale": "because"})
+
+
+def test_create_file_yml_parses():
+    from dbt_fixer.proposal import parse_proposal
+
+    p = parse_proposal(_proposal_json([
+        {"type": "create_file", "path": "models/staging/_new__models.yml", "content": "version: 2\n"}
+    ]))
+    assert p is not None and p.edits[0].kind == "create_file"
+
+
+def test_create_file_sql_rejected_at_parse():
+    from dbt_fixer.proposal import parse_proposal
+
+    assert parse_proposal(_proposal_json([
+        {"type": "create_file", "path": "models/evil.sql", "content": "select 1"}
+    ])) is None
+
+
+def test_create_file_empty_content_or_extra_keys_rejected():
+    from dbt_fixer.proposal import parse_proposal
+
+    assert parse_proposal(_proposal_json([
+        {"type": "create_file", "path": "models/x.yml", "content": "   "}
+    ])) is None
+    assert parse_proposal(_proposal_json([
+        {"type": "create_file", "path": "models/x.yml", "content": "a", "mode": "755"}
+    ])) is None
+
+
+def test_declination_is_detected_with_rationale():
+    from dbt_fixer.proposal import parse_declination
+
+    raw = '{"edits": [], "rationale": "fix requires creating a file type I cannot"}'
+    assert parse_declination(raw) == "fix requires creating a file type I cannot"
+    assert parse_declination('{"edits": [{"type": "x"}], "rationale": "r"}') is None
+    assert parse_declination("not json") is None

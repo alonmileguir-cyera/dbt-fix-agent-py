@@ -263,3 +263,53 @@ def test_conflict_detection_happens_before_any_mutation(tmp_path: Path) -> None:
 
     assert (root / "models" / "a.sql").read_text(encoding="utf-8") == original_a
     assert (root / "models" / "b.sql").read_text(encoding="utf-8") == original_b
+
+
+# ---------------------------------------------------------------------------
+# create_file application
+# ---------------------------------------------------------------------------
+
+
+def test_create_file_creates_parents_and_writes(tmp_path):
+    from dbt_fixer.applier import apply_proposal
+    from dbt_fixer.proposal import Edit, Proposal
+
+    proposal = Proposal(
+        edits=(Edit(kind="create_file", path="models/staging/newdir/_m.yml", content="version: 2\n"),),
+        rationale="r",
+    )
+    applied = apply_proposal(tmp_path, proposal)
+    assert (tmp_path / "models/staging/newdir/_m.yml").read_text() == "version: 2\n"
+    assert applied.changed_paths == ("models/staging/newdir/_m.yml",)
+
+
+def test_create_file_existing_target_rejected(tmp_path):
+    import pytest
+
+    from dbt_fixer.applier import EditTargetAlreadyExistsError, apply_proposal
+    from dbt_fixer.proposal import Edit, Proposal
+
+    (tmp_path / "models").mkdir()
+    (tmp_path / "models/x.yml").write_text("already here")
+    proposal = Proposal(
+        edits=(Edit(kind="create_file", path="models/x.yml", content="new"),),
+        rationale="r",
+    )
+    with pytest.raises(EditTargetAlreadyExistsError):
+        apply_proposal(tmp_path, proposal)
+    assert (tmp_path / "models/x.yml").read_text() == "already here"  # untouched
+
+
+def test_create_file_traversal_rejected(tmp_path):
+    import pytest
+
+    from dbt_fixer.applier import apply_proposal
+    from dbt_fixer.pathsafe import PathTraversalError
+    from dbt_fixer.proposal import Edit, Proposal
+
+    proposal = Proposal(
+        edits=(Edit(kind="create_file", path="../outside.yml", content="x"),),
+        rationale="r",
+    )
+    with pytest.raises(PathTraversalError):
+        apply_proposal(tmp_path, proposal)

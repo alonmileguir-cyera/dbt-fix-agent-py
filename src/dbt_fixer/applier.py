@@ -46,6 +46,10 @@ class ApplyError(RuntimeError):
     """
 
 
+class EditTargetAlreadyExistsError(ApplyError):
+    """A `create_file` edit targets a path that already exists."""
+
+
 class EditTargetNotFoundError(ApplyError):
     """An edit's `path` does not exist in the scratch copy."""
 
@@ -80,6 +84,12 @@ def _resolved_target(scratch_root: Path, edit: Edit) -> Path:
     """
 
     resolved = resolve_within_root(scratch_root, edit.path)
+    if edit.kind == "create_file":
+        if resolved.exists():
+            raise EditTargetAlreadyExistsError(
+                f"create_file target already exists: {edit.path!r}"
+            )
+        return resolved
     if not resolved.exists():
         raise EditTargetNotFoundError(f"edit target does not exist: {edit.path!r}")
     if resolved.is_dir():
@@ -103,6 +113,12 @@ def _check_conflicts(edits_by_path: Dict[str, List[Edit]]) -> None:
     for path, edits in edits_by_path.items():
         whole_file_edits = [e for e in edits if e.kind == "whole_file_replace"]
         line_range_edits = [e for e in edits if e.kind == "line_range_edit"]
+        create_edits = [e for e in edits if e.kind == "create_file"]
+
+        if create_edits and (len(edits) > 1):
+            raise ConflictingEditsError(
+                f"a create_file edit must be the only edit for its path: {path!r}"
+            )
 
         if len(whole_file_edits) > 1:
             raise ConflictingEditsError(
@@ -134,6 +150,14 @@ def _validate_line_range(edit: Edit, target: Path) -> None:
             f"line range [{edit.start_line}, {edit.end_line}] is out of bounds for "
             f"{edit.path!r}, which has {line_count} line(s)"
         )
+
+
+def _apply_create_file(target: Path, edit: Edit) -> None:
+    assert edit.content is not None  # guaranteed by parse_proposal
+    # Parent dirs are descendants of the already-containment-checked target,
+    # so creating them cannot escape the scratch root.
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(edit.content, encoding="utf-8", newline="")
 
 
 def _apply_whole_file_replace(target: Path, edit: Edit) -> None:
@@ -210,7 +234,10 @@ def apply_proposal(scratch_root: "str | Path", proposal: Proposal) -> AppliedPro
         target = targets_by_path[path]
         whole_file_edits = [e for e in edits if e.kind == "whole_file_replace"]
         line_range_edits = [e for e in edits if e.kind == "line_range_edit"]
-        if whole_file_edits:
+        create_edits = [e for e in edits if e.kind == "create_file"]
+        if create_edits:
+            _apply_create_file(target, create_edits[0])
+        elif whole_file_edits:
             _apply_whole_file_replace(target, whole_file_edits[0])
         elif line_range_edits:
             _apply_line_range_edits(target, line_range_edits)

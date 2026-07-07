@@ -32,12 +32,18 @@ from .fencing import FencedContext
 from .model_output import extract_json_object
 from .pathsafe import resolve_within_root
 
-EditKind = Literal["whole_file_replace", "line_range_edit"]
+EditKind = Literal["whole_file_replace", "line_range_edit", "create_file"]
 
-_VALID_EDIT_TYPES: Tuple[str, ...] = ("whole_file_replace", "line_range_edit")
+_VALID_EDIT_TYPES: Tuple[str, ...] = ("whole_file_replace", "line_range_edit", "create_file")
+
+# create_file may only produce documentation/contract files - never
+# executable model SQL. Enforced at parse time (fail-closed, before the
+# applier or any gate ever sees the edit).
+_CREATE_FILE_ALLOWED_SUFFIXES: Tuple[str, ...] = (".yml", ".yaml", ".md")
 
 _TOP_LEVEL_KEYS = frozenset({"edits", "rationale"})
 _WHOLE_FILE_KEYS = frozenset({"type", "path", "content"})
+_CREATE_FILE_KEYS = frozenset({"type", "path", "content"})
 _LINE_RANGE_KEYS = frozenset({"type", "path", "start_line", "end_line", "replacement"})
 
 # The exact JSON shape the model must answer in. Kept as a single constant so
@@ -59,15 +65,19 @@ matching this schema precisely:
 {
   "edits": [
     {"type": "whole_file_replace", "path": "<repo-relative path>", "content": "<full new file content>"},
-    {"type": "line_range_edit", "path": "<repo-relative path>", "start_line": <int, 1-indexed, inclusive>, "end_line": <int, 1-indexed, inclusive>, "replacement": "<replacement text>"}
+    {"type": "line_range_edit", "path": "<repo-relative path>", "start_line": <int, 1-indexed, inclusive>, "end_line": <int, 1-indexed, inclusive>, "replacement": "<replacement text>"},
+    {"type": "create_file", "path": "<repo-relative path of a NEW .yml/.yaml/.md file>", "content": "<full file content>"}
   ],
   "rationale": "<plain-language explanation of why this fixes the named failure>"
 }
 
 Rules:
-- "edits" must be a non-empty list; every entry must be one of the two
+- "edits" must be a non-empty list; every entry must be one of the three
   shapes above, with no extra fields.
-- Every edit must target a file that already exists in the checkout.
+- whole_file_replace / line_range_edit must target a file that already
+  exists in the checkout. create_file must target a path that does NOT
+  exist yet, and may only create .yml/.yaml/.md files (e.g. a missing
+  schema/models .yml file) - never .sql.
 - If you cannot identify a safe, minimal fix, do not guess: answer with an
   empty "edits" list and explain why in "rationale".
 - Do not include any text outside the single JSON object.
@@ -124,6 +134,19 @@ def _parse_edit(raw: object) -> Optional[Edit]:
             return None
         return Edit(kind="whole_file_replace", path=path, content=content)
 
+    if edit_type == "create_file":
+        if set(raw.keys()) != _CREATE_FILE_KEYS:
+            return None
+        path = raw.get("path")
+        content = raw.get("content")
+        if not isinstance(path, str) or not path.strip():
+            return None
+        if not isinstance(content, str) or not content.strip():
+            return None
+        if not path.strip().lower().endswith(_CREATE_FILE_ALLOWED_SUFFIXES):
+            return None
+        return Edit(kind="create_file", path=path, content=content)
+
     # edit_type == "line_range_edit"
     if set(raw.keys()) != _LINE_RANGE_KEYS:
         return None
@@ -149,6 +172,26 @@ def _parse_edit(raw: object) -> Optional[Edit]:
         end_line=end_line,
         replacement=replacement,
     )
+
+
+def parse_declination(raw: object) -> Optional[str]:
+    """Detect the honest 'no safe fix' answer the instructions permit.
+
+    The instructions tell the model: if you cannot identify a safe, minimal
+    fix, answer with an empty "edits" list and explain why in "rationale".
+    That is a valid, meaningful outcome - it must surface as an explained
+    no_safe_fix, never be mislabeled as unparseable output. Returns the
+    rationale when `raw` matches exactly that shape, else None.
+    """
+
+    parsed = extract_json_object(raw)
+    if parsed is None or set(parsed.keys()) != _TOP_LEVEL_KEYS:
+        return None
+    rationale = parsed.get("rationale")
+    edits = parsed.get("edits")
+    if isinstance(edits, list) and not edits and isinstance(rationale, str) and rationale.strip():
+        return rationale.strip()
+    return None
 
 
 def parse_proposal(raw: object) -> Optional[Proposal]:
@@ -349,7 +392,9 @@ def run_proposal_pass(
         return ProposalPassResult(
             proposal=None,
             no_proposal_reason=(
-                "model output did not match the required structured-proposal schema"
+                f"model found no safe fix: {declination}"
+                if (declination := parse_declination(raw_text)) is not None
+                else "model output did not match the required structured-proposal schema"
             ),
             raw_output=raw_text,
         )
