@@ -34,15 +34,44 @@ printed; every one of those cases resolves to `failed` (environment/
 internal problems) or `no_safe_fix` (an honest "nothing to fix" or
 "identified but couldn't act on it" conclusion) with a stated reason.
 
-**This sprint's entrypoint only wires Stage 1** (environment validation +
-failure-context intake, `dbt_fixer.pipeline.run_stage1`). The
-structured-fix-proposal pass and the allowlist/re-audit/fix-refuter/
-dbt-parse gates exist as library modules but are not yet invoked from the
-entrypoint, so `proposed` cannot be produced by a real invocation yet —
-even a cleanly-identified failure target resolves to `no_safe_fix` with a
-reason naming the target and stating that no fix pipeline ran. A later
-sprint's contract wires that pipeline into this same entrypoint without
-changing this stdout contract.
+**The entrypoint wires the full pipeline.** `dbt_fixer.pipeline.run_stage1`
+(environment validation + failure-context intake) always runs first; a
+terminal Stage 1 result (bad environment, or an unparseable failure
+context) is final. Otherwise the bounded propose/apply/gate loop
+(`dbt_fixer.retry_loop.run_bounded_fix_attempt`) runs against real,
+production seams (`dbt_fixer.runners`: a Bedrock-backed model runner for
+the proposal pass, an independently-constructed one for the fix-refuter
+pass, and real subprocess runners for the sealed-auditor re-audit and
+`dbt parse` gates). Whatever that attempt resolves to — `proposed`,
+`no_safe_fix`, or `failed` — is reported, unconditionally, to Slack
+(`dbt_fixer.slack_delivery.deliver_shadow_report`, which never raises and
+never influences the already-computed result) and then to stdout.
+
+## Fresh install
+
+This package installs and runs with nothing beyond what `pyproject.toml`
+declares — no vendored state, no implicit external service required to
+*start* (a missing Bedrock/Slack/auditor credential fails closed to
+`failed`/`no_safe_fix` with a specific reason, never a crash):
+
+```
+python -m venv /tmp/dbt-fixer-fresh-venv
+source /tmp/dbt-fixer-fresh-venv/bin/activate
+pip install .
+python -m dbt_fixer.entrypoint
+```
+
+The last command runs with an empty environment. Since `DBT_FIXER_FAILURE_KIND`
+and `DBT_FIXER_REPO_PATH` are both required and unset, this prints exactly:
+
+```
+dbt-fixer-reason: <a message naming the missing required variable(s)>
+dbt-fixer-status: failed
+```
+
+and exits `0` — proving the package is importable, its console entrypoint
+runs end-to-end, and its fail-closed contract holds, all from a clean
+install with no test extras and no fixture scaffolding involved.
 
 ## Running the tests
 
@@ -53,8 +82,13 @@ pytest
 
 The suite is fully offline: `tests/conftest.py` actively blocks real network
 sockets and real subprocess spawns for every test, except a test explicitly
-marked `@pytest.mark.real_process` (reserved, starting in a later sprint, for
-one clearly-marked real-process integration module).
+marked `@pytest.mark.real_process`, which is excluded from collection by
+default (see `[tool.pytest.ini_options]` in `pyproject.toml`) and must be
+run explicitly:
+
+```
+pytest -m real_process tests/real_process
+```
 
 ## Environment contract
 
