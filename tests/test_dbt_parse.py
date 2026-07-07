@@ -99,12 +99,23 @@ def test_gate_runs_dbt_parse_against_touched_project_dir_and_passes(tmp_path):
     assert call["cwd"] != repo
 
 
-def test_gate_kills_candidate_on_nonzero_exit(tmp_path):
+def test_gate_kills_candidate_on_nonzero_exit_when_baseline_is_clean(tmp_path):
+    """Differential contract: a nonzero candidate parse only kills the
+    candidate when the unpatched baseline parses cleanly (the patch is
+    what broke parse). The candidate scratch is probed first, the
+    baseline second."""
     repo = _make_repo(tmp_path)
     diff = _candidate_diff(repo, tmp_path, "select 1\nfrom x\nwhere y = 1\n")
-    runner = _RecordingDbtRunner(
-        ProcessOutcome(returncode=1, stdout="", stderr="Compilation Error: bad ref()")
-    )
+
+    outcomes = [
+        ProcessOutcome(returncode=1, stdout="", stderr="Compilation Error: bad ref()"),
+        ProcessOutcome(returncode=0, stdout="", stderr=""),  # baseline: clean
+    ]
+    calls = []
+
+    def runner(args, cwd, timeout_seconds):
+        calls.append({"args": args, "cwd": cwd})
+        return outcomes[len(calls) - 1]
 
     verdict = run_dbt_parse_gate(
         repo_root=repo,
@@ -117,6 +128,31 @@ def test_gate_kills_candidate_on_nonzero_exit(tmp_path):
     assert verdict.outcome == "failed"
     assert verdict.passed is False
     assert "bad ref" in verdict.reason
+    assert len(calls) == 2  # candidate then baseline
+
+
+def test_gate_skips_when_baseline_also_fails_to_parse(tmp_path):
+    """Environmental failure (missing profile/deps, pre-existing project
+    error): the unpatched baseline fails too, so the candidate's nonzero
+    exit is not the patch's fault -> best-effort skip, never a kill.
+    This is exactly the e2e run-13 case ('Could not find profile')."""
+    repo = _make_repo(tmp_path)
+    diff = _candidate_diff(repo, tmp_path, "select 1\nfrom x\nwhere y = 1\n")
+    runner = _RecordingDbtRunner(
+        ProcessOutcome(returncode=2, stdout="", stderr="Could not find profile")
+    )
+
+    verdict = run_dbt_parse_gate(
+        repo_root=repo,
+        candidate_diff=diff,
+        timeout_seconds=10.0,
+        subprocess_runner=runner,
+        which=_fake_which(),
+    )
+
+    assert verdict.outcome == "skipped"
+    assert verdict.passed is False
+    assert "environmental" in verdict.reason
 
 
 def test_gate_kills_candidate_on_timeout(tmp_path):

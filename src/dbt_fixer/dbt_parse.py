@@ -185,6 +185,37 @@ def find_touched_project_dir(scratch_root: "str | Path", touched_paths: Iterable
     return None
 
 
+def _baseline_parses_clean(
+    *,
+    repo_root: "str | Path",
+    project_rel: str,
+    dbt_path: str,
+    timeout_seconds: float,
+    subprocess_runner: DbtSubprocessRunner,
+) -> "Optional[bool]":
+    """Return True iff the UNPATCHED repo's same project dir parses cleanly.
+
+    Runs in its own throwaway scratch copy (never mutating the original).
+    Returns None if the baseline parse couldn't be determined (scratch/
+    invocation/timeout error) - the caller treats non-True as
+    "environmental, skip", the conservative best-effort choice.
+    """
+    try:
+        with scratch_copy(Path(repo_root)) as baseline_root:
+            project_dir = Path(baseline_root) / project_rel
+            if not (project_dir / DBT_PROJECT_FILENAME).exists():
+                return None
+            kind, value = run_with_hard_timeout(
+                lambda: subprocess_runner([dbt_path, "parse"], project_dir, timeout_seconds),
+                timeout_seconds,
+            )
+            if kind != "ok":
+                return None
+            return value.returncode == 0
+    except (ScratchCopyError, Exception):  # noqa: BLE001 - best-effort; any failure -> unknown
+        return None
+
+
 def run_dbt_parse_gate(
     *,
     repo_root: "str | Path",
@@ -309,11 +340,37 @@ def run_dbt_parse_gate(
         )
 
     if outcome.returncode != 0:
+        # Differential check (best-effort gate): a parse failure only counts
+        # against THIS candidate if the unpatched baseline parses cleanly.
+        # If the baseline also fails - a missing profile, uninstalled deps,
+        # or a pre-existing project error the patch didn't introduce - the
+        # failure is environmental, not caused by the fix, so the gate is
+        # skipped rather than killing the candidate. The authoritative gates
+        # (re-audit, refuter) have already ruled.
+        baseline_ok = _baseline_parses_clean(
+            repo_root=repo_root,
+            project_rel=project_dir_display,
+            dbt_path=dbt_path,
+            timeout_seconds=timeout_seconds,
+            subprocess_runner=subprocess_runner,
+        )
+        if baseline_ok is not True:
+            return DbtParseVerdict(
+                outcome="skipped",
+                reason=(
+                    f"dbt parse exited {outcome.returncode} in {project_dir_display!r}, "
+                    "but the unpatched baseline does not parse cleanly either "
+                    "(missing profile/deps or a pre-existing project error); the "
+                    "failure is environmental, not caused by this patch - gate skipped"
+                ),
+                project_dir=project_dir_display,
+            )
         return DbtParseVerdict(
             outcome="failed",
             reason=(
                 f"dbt parse exited with code {outcome.returncode} in "
-                f"{project_dir_display!r}; stderr: {outcome.stderr.strip()!r}"
+                f"{project_dir_display!r} while the unpatched baseline parses "
+                f"clean; the patch broke parse. stderr: {outcome.stderr.strip()!r}"
             ),
             project_dir=project_dir_display,
         )

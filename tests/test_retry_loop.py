@@ -497,8 +497,16 @@ def test_dbt_parse_gate_failure_rejects_the_round_but_stays_non_authoritative_on
     def _fake_which(name: str):
         return "/usr/local/bin/dbt" if name == "dbt" else None
 
+    # Differential contract: the CANDIDATE parse fails while the BASELINE
+    # parses clean (calls alternate candidate, baseline per round), so the
+    # failure is genuinely the patch's fault and must reject the round.
+    dbt_calls = {"n": 0}
+
     def _failing_dbt_subprocess_runner(argv, cwd, timeout_seconds):
-        return ProcessOutcome(returncode=1, stdout="", stderr="Compilation Error: bad ref()")
+        dbt_calls["n"] += 1
+        if dbt_calls["n"] % 2 == 1:  # candidate scratch
+            return ProcessOutcome(returncode=1, stdout="", stderr="Compilation Error: bad ref()")
+        return ProcessOutcome(returncode=0, stdout="", stderr="")  # baseline
 
     result = _call(
         config=_config(repo, max_rounds=2),
