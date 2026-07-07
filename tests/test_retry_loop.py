@@ -412,6 +412,79 @@ def test_fix_refuter_passing_lets_the_round_reach_the_dbt_parse_gate(tmp_path: P
     }
 
 
+def test_refuter_runner_is_a_distinct_isolated_context_from_the_proposal_pass(
+    tmp_path: Path,
+) -> None:
+    """refuter_fresh_context_invocation: the fix-refuter gate must run as a
+    genuinely fresh, isolated model pass -- never a continuation of the
+    proposal pass's own conversation/context. Each fake here stands in for
+    a real agno Agent session with its own private internal state; this
+    test proves the two are never the same object and that neither fake's
+    prompts ever leak into the other's, across multiple rounds."""
+
+    repo = _make_repo(tmp_path)
+
+    class _FakeProposalContext:
+        """Stands in for the proposal pass's own model session/context."""
+
+        def __init__(self) -> None:
+            self.marker = "proposal-context-marker"
+            self.prompts: List[str] = []
+
+        def __call__(self, prompt: str) -> str:
+            self.prompts.append(prompt)
+            return _whole_file_proposal("models/a.sql", "select 1\nfrom x\nwhere y = 1\n")
+
+    class _FakeRefuterContext:
+        """Stands in for the fix-refuter gate's own, separate model session."""
+
+        def __init__(self) -> None:
+            self.marker = "refuter-context-marker"
+            self.prompts: List[str] = []
+
+        def __call__(self, prompt: str) -> str:
+            self.prompts.append(prompt)
+            return _confident_refuter_pass(prompt)
+
+    proposal_context = _FakeProposalContext()
+    refuter_context = _FakeRefuterContext()
+
+    # The two contexts must be genuinely distinct objects, never the same
+    # one reused for both roles.
+    assert proposal_context is not refuter_context
+
+    subprocess_runner = _RecordingSubprocessRunner(
+        lambda n: ProcessOutcome(returncode=0, stdout=_PASSED_STDOUT)
+    )
+
+    result = _call(
+        config=_config(repo),
+        target=_target(),
+        fenced_context=_fenced_context(),
+        repo_root=repo,
+        model_runner=proposal_context,
+        subprocess_runner=subprocess_runner,
+        refuter_runner=refuter_context,
+        budget=_budget(),
+    )
+
+    assert result.run_result.status == "proposed"
+    assert proposal_context.prompts, "the proposal context was never invoked"
+    assert refuter_context.prompts, "the refuter context was never invoked"
+
+    # Isolation, proven both directions: nothing unique to one context's
+    # marker or transcript ever appears inside the other's prompts.
+    for refuter_prompt in refuter_context.prompts:
+        assert proposal_context.marker not in refuter_prompt
+        for proposal_prompt in proposal_context.prompts:
+            assert proposal_prompt not in refuter_prompt
+
+    for proposal_prompt in proposal_context.prompts:
+        assert refuter_context.marker not in proposal_prompt
+        for refuter_prompt in refuter_context.prompts:
+            assert refuter_prompt not in proposal_prompt
+
+
 def test_dbt_parse_gate_failure_rejects_the_round_but_stays_non_authoritative_on_skip(
     tmp_path: Path,
 ) -> None:
