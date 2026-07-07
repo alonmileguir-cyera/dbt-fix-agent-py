@@ -21,7 +21,7 @@ from dbt_fixer.bounds import Bounds, ExecutionBudget
 from dbt_fixer.env import FixerConfig
 from dbt_fixer.fencing import fence_context
 from dbt_fixer.intake import FailingCheck, FailureTarget
-from dbt_fixer.reaudit import ProcessOutcome
+from dbt_fixer.reaudit import AuditorInvocationError, ProcessOutcome
 from dbt_fixer.retry_loop import run_bounded_fix_attempt
 
 # --- fixtures ----------------------------------------------------------------
@@ -546,10 +546,53 @@ def test_missing_auditor_interpreter_is_no_safe_fix_and_stops_immediately(tmp_pa
     )
 
     assert result.run_result.status == "no_safe_fix"
+    # Never a silently-skipped gate and never `proposed`: the reason string
+    # explicitly names the missing auditor, not a generic/opaque failure.
+    assert result.run_result.status != "proposed"
+    assert "auditor" in result.run_result.reason.lower()
+    assert "DBT_FIXER_AUDITOR_PYTHON" in result.run_result.reason
     # A missing interpreter can't be fixed by retrying -- the loop stops
     # after the very first round instead of burning all 5.
     assert result.rounds_used == 1
     assert len(subprocess_runner.calls) == 0
+
+
+def test_uninvokable_auditor_interpreter_is_also_a_no_safe_fix_naming_the_auditor(
+    tmp_path: Path,
+) -> None:
+    """Distinct from an *unconfigured* interpreter: here `auditor_python` is
+    set, but invoking it raises (e.g. the path doesn't actually exist on
+    this host). This must fail closed exactly the same way -- `no_safe_fix`,
+    never `proposed`, never a silently-skipped gate -- with a reason that
+    still names the auditor, not a raw stack trace.
+    """
+
+    repo = _make_repo(tmp_path)
+    model_runner = _RecordingModelRunner(
+        lambda n: _whole_file_proposal("models/a.sql", f"select 1\nfrom x\nwhere y = {n}\n")
+    )
+
+    def _raise_invocation_error(args, env, cwd, timeout):
+        raise AuditorInvocationError(
+            "could not start the sealed auditor: "
+            "[Errno 2] No such file or directory: '/does/not/exist/python3.11'"
+        )
+
+    result = _call(
+        config=_config(repo, max_rounds=5, auditor_python="/does/not/exist/python3.11"),
+        target=_target(),
+        fenced_context=_fenced_context(),
+        repo_root=repo,
+        model_runner=model_runner,
+        subprocess_runner=_raise_invocation_error,
+        budget=_budget(),
+    )
+
+    assert result.run_result.status == "no_safe_fix"
+    assert "auditor" in result.run_result.reason.lower()
+    assert "Exception:" not in result.run_result.reason
+    assert "Traceback" not in result.run_result.reason
+    assert result.rounds_used == 1
 
 
 def test_unexpected_exception_in_a_gate_resolves_to_failed_not_no_safe_fix(tmp_path: Path) -> None:
