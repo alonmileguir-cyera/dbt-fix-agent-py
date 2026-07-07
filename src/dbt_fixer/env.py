@@ -28,7 +28,7 @@ Environment-contract table (this module's slice of it):
 | `DBT_FIXER_MAX_CHANGED_FILES`  | no       | `5`                 | non-numeric/out-of-`[1, 50]` -> falls back to `5`, records a warning |
 | `DBT_FIXER_MAX_CHANGED_LINES`  | no       | `60`                | non-numeric/out-of-`[1, 2000]` -> falls back to `60`, records a warning |
 | `DBT_FIXER_REAUDIT_TIMEOUT_SECONDS` | no  | `900`               | non-numeric/out-of-`[1, 1800]` -> falls back to `900`, records a warning |
-| `DBT_FIXER_REFUTER_TIMEOUT_SECONDS` | no  | `300`               | non-numeric/out-of-`[1, 600]` -> falls back to `300`, records a warning |
+| `DBT_FIXER_REFUTER_TIMEOUT_SECONDS` | no  | `600`               | non-numeric/out-of-`[1, 1200]` -> falls back to `600`, records a warning |
 | `DBT_FIXER_DBT_PARSE_TIMEOUT_SECONDS` | no | `30`               | non-numeric/out-of-`[1, 300]` -> falls back to `30`, records a warning |
 
 `FixerConfig.warnings` carries every fallback-to-default explanation so a
@@ -67,11 +67,13 @@ _MAX_CHANGED_LINES_RANGE = (1, 2000)
 DEFAULT_REAUDIT_TIMEOUT_SECONDS = 900
 _REAUDIT_TIMEOUT_SECONDS_RANGE = (1, 1800)
 
-# The refuter is a real Bedrock reasoning pass (it inspects the candidate
-# diff and the repo before answering); 60s tripped on a healthy refuter at
-# the last gate (e2e run 10, right after a passing re-audit).
-DEFAULT_REFUTER_TIMEOUT_SECONDS = 300
-_REFUTER_TIMEOUT_SECONDS_RANGE = (1, 600)
+# The refuter is a full AGENTIC pass (its own read/search repo tools, same
+# shape as the proposal pass): a multi-turn investigation, each turn a
+# Bedrock call. It needs the same minutes-scale budget as the other real-
+# model gates - 60s then 300s both clipped a healthy refuter (e2e runs
+# 10-11), each right after a *passing* re-audit.
+DEFAULT_REFUTER_TIMEOUT_SECONDS = 600
+_REFUTER_TIMEOUT_SECONDS_RANGE = (1, 1200)
 
 DEFAULT_DBT_PARSE_TIMEOUT_SECONDS = 30
 _DBT_PARSE_TIMEOUT_SECONDS_RANGE = (1, 300)
