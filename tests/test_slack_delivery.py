@@ -209,7 +209,7 @@ def test_detail_sections_appear_in_fixed_order_diff_rationale_gate_detail():
         client_factory=lambda t, c=client: c,
     )
     full_detail = "\n".join(call["text"] for call in _detail_calls(client))
-    diff_pos = full_detail.index("*Diff*")
+    diff_pos = full_detail.index("*Proposed patch*")
     rationale_pos = full_detail.index("*Rationale*")
     gate_pos = full_detail.index("*Gate detail*")
     assert diff_pos < rationale_pos < gate_pos
@@ -246,7 +246,7 @@ def test_no_candidate_diff_still_produces_a_labeled_diff_section():
         client_factory=lambda t, c=client: c,
     )
     full_detail = "\n".join(call["text"] for call in _detail_calls(client))
-    assert "*Diff*" in full_detail
+    assert "*Proposed patch*" in full_detail
     assert "No candidate diff" in full_detail
 
 
@@ -478,3 +478,74 @@ def test_secret_like_content_in_reason_is_redacted_in_summary_and_detail():
     assert "SuperSecretValue123" not in _summary_call(client)["text"]
     for call in _detail_calls(client):
         assert "SuperSecretValue123" not in call["text"]
+
+
+# ---------------------------------------------------------------------------
+# plain-English change summary (readability: what the patch DOES)
+# ---------------------------------------------------------------------------
+
+
+def test_summary_states_what_the_patch_does():
+    from dbt_fixer.slack_delivery import _build_summary_text
+    from dbt_fixer.status import GateResult, RunResult
+
+    diff = (
+        "diff --git a/proj/models/staging/_x__models.yml b/proj/models/staging/_x__models.yml\n"
+        "--- /dev/null\n"
+        "+++ b/proj/models/staging/_x__models.yml\n"
+        "@@ -0,0 +1,2 @@\n"
+        "+version: 2\n"
+        "+models: []\n"
+    )
+    text = _build_summary_text(
+        RunResult(status="proposed", reason="ok", gates=[GateResult("allowlist", "pass")]),
+        failure_kind="audit",
+        pr_url="https://example.com/pr/1",
+        candidate_diff=diff,
+    )
+    assert "*Proposed change:* creates `proj/models/staging/_x__models.yml` (+2 lines)" in text
+
+
+def test_diff_file_summary_covers_create_modify_delete():
+    from dbt_fixer.slack_delivery import _summarize_diff_files
+
+    diff = (
+        "diff --git a/a.yml b/a.yml\n--- /dev/null\n+++ b/a.yml\n@@ -0,0 +1 @@\n+x\n"
+        "diff --git a/b.sql b/b.sql\n--- a/b.sql\n+++ b/b.sql\n@@ -1,2 +1,2 @@\n-old\n+new\n"
+        "diff --git a/c.md b/c.md\n--- a/c.md\n+++ /dev/null\n@@ -1 +0,0 @@\n-gone\n"
+    )
+    assert _summarize_diff_files(diff) == [
+        "creates `a.yml` (+1 lines)",
+        "modifies `b.sql` (+1/-1 lines)",
+        "deletes `c.md` (-1 lines)",
+    ]
+
+
+def test_detail_thread_has_breakdown_and_apply_hint():
+    from dbt_fixer.slack_delivery import _build_detail_text
+    from dbt_fixer.status import RunResult
+
+    diff = (
+        "diff --git a/a.yml b/a.yml\n--- /dev/null\n+++ b/a.yml\n@@ -0,0 +1 @@\n+x\n"
+    )
+    text = _build_detail_text(
+        RunResult(status="proposed", reason="ok", gates=[]), candidate_diff=diff
+    )
+    assert "*Proposed patch*" in text
+    assert "git apply" in text
+    assert "creates `a.yml` (+1 lines)" in text
+    assert "```diff" in text
+
+
+def test_malformed_diff_degrades_to_no_change_line():
+    from dbt_fixer.slack_delivery import _build_summary_text, _summarize_diff_files
+    from dbt_fixer.status import RunResult
+
+    assert _summarize_diff_files("complete garbage, not a diff") == []
+    text = _build_summary_text(
+        RunResult(status="proposed", reason="ok", gates=[]),
+        failure_kind="audit",
+        pr_url="",
+        candidate_diff="complete garbage, not a diff",
+    )
+    assert "*Proposed change:*" not in text  # presentation never fabricates

@@ -112,7 +112,51 @@ class SlackDeliveryResult:
     reason: str
 
 
-def _build_summary_text(run_result: RunResult, *, failure_kind: str, pr_url: str) -> str:
+def _summarize_diff_files(diff_text: str) -> "list[str]":
+    """Plain-English per-file lines for a unified diff: what the patch DOES.
+
+    Pure text scan (no diff library): tolerant of any diff dialect the
+    pipeline emits, and a malformed diff simply yields fewer/no lines --
+    this is presentation, never validation (the applier owns that).
+    """
+
+    files: "list[dict]" = []
+    current: "Optional[dict]" = None
+    for line in (diff_text or "").splitlines():
+        if line.startswith("diff --git "):
+            parts = line.split()
+            path = parts[-1][2:] if parts[-1].startswith("b/") else parts[-1]
+            current = {"path": path, "created": False, "deleted": False, "plus": 0, "minus": 0}
+            files.append(current)
+        elif current is not None and line.startswith("--- "):
+            if line[4:].strip() == "/dev/null":
+                current["created"] = True
+        elif current is not None and line.startswith("+++ "):
+            if line[4:].strip() == "/dev/null":
+                current["deleted"] = True
+        elif current is not None and line.startswith("+") and not line.startswith("+++"):
+            current["plus"] += 1
+        elif current is not None and line.startswith("-") and not line.startswith("---"):
+            current["minus"] += 1
+
+    lines = []
+    for f in files:
+        if f["created"]:
+            action = "creates"
+            counts = f"+{f['plus']} lines"
+        elif f["deleted"]:
+            action = "deletes"
+            counts = f"-{f['minus']} lines"
+        else:
+            action = "modifies"
+            counts = f"+{f['plus']}/-{f['minus']} lines"
+        lines.append(f"{action} `{f['path']}` ({counts})")
+    return lines
+
+
+def _build_summary_text(
+    run_result: RunResult, *, failure_kind: str, pr_url: str, candidate_diff: str = ""
+) -> str:
     glyph = run_result.glyph()
     pr_line = f"*PR:* {pr_url.strip()}\n" if pr_url and pr_url.strip() else ""
     reason = run_result.reason.strip() if run_result.reason and run_result.reason.strip() else (
@@ -121,23 +165,38 @@ def _build_summary_text(run_result: RunResult, *, failure_kind: str, pr_url: str
     scoreboard = " | ".join(f"{gate.glyph()} {gate.name}" for gate in run_result.gates) or (
         "no gates recorded"
     )
+    file_lines = _summarize_diff_files(candidate_diff)
+    if file_lines:
+        shown = file_lines[:5]
+        if len(file_lines) > 5:
+            shown.append(f"...and {len(file_lines) - 5} more file(s)")
+        change_lines = "*Proposed change:* " + "; ".join(shown) + "\n"
+    else:
+        change_lines = ""
     return (
         f"{glyph} *Status:* `{run_result.status}`\n"
         f"{pr_line}"
         f"*Failure kind:* `{failure_kind}`\n"
         f"{reason}\n"
+        f"{change_lines}"
         f"*Gates:* {scoreboard}\n"
-        "\U0001f9f5 Full diff and gate detail posted as threaded replies below."
+        "\U0001f9f5 Full patch and gate detail posted as threaded replies below."
     )
 
 
 def _build_detail_text(run_result: RunResult, *, candidate_diff: str) -> str:
     diff_body = candidate_diff.strip() if candidate_diff else ""
-    diff_section = (
-        f"*Diff*\n```diff\n{diff_body}\n```"
-        if diff_body
-        else "*Diff*\nNo candidate diff was produced for this run."
-    )
+    if diff_body:
+        file_lines = _summarize_diff_files(diff_body)
+        breakdown = ("\n".join(f"\u2022 {line}" for line in file_lines) + "\n") if file_lines else ""
+        diff_section = (
+            "*Proposed patch* -- verified by the gate stack above; a human"
+            " must still review and apply it (`git apply` on the PR branch):\n"
+            f"{breakdown}"
+            f"```diff\n{diff_body}\n```"
+        )
+    else:
+        diff_section = "*Proposed patch*\nNo candidate diff was produced for this run."
 
     reason = run_result.reason.strip() if run_result.reason and run_result.reason.strip() else (
         "no additional detail provided"
@@ -334,7 +393,9 @@ def deliver_shadow_report(
         )
 
     summary_text = redact_secrets(
-        _build_summary_text(run_result, failure_kind=failure_kind, pr_url=pr_url)
+        _build_summary_text(
+            run_result, failure_kind=failure_kind, pr_url=pr_url, candidate_diff=candidate_diff
+        )
     )
     summary_ts, summary_posted, summary_reason = _post_summary(
         client, channel=channel, text=summary_text
