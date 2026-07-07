@@ -22,6 +22,7 @@ than hanging or looping.
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,6 +32,8 @@ from .bounds import BoundedExecutionError, ExecutionBudget
 from .fencing import FencedContext
 from .model_output import extract_json_object
 from .pathsafe import resolve_within_root
+
+_LOGGER = logging.getLogger(__name__)
 
 EditKind = Literal["whole_file_replace", "line_range_edit", "create_file"]
 
@@ -389,11 +392,23 @@ def run_proposal_pass(
     raw_text = raw if isinstance(raw, str) else None
     proposal = parse_proposal(raw)
     if proposal is None:
+        declination = parse_declination(raw_text)
+        if declination is None:
+            # Schema failures are the one place where flying blind is
+            # unacceptable: log the (redacted, truncated) raw output so a
+            # production no_safe_fix is diagnosable from logs alone.
+            from .redaction import redact_secrets
+
+            _LOGGER.error(
+                "proposal did not match the structured schema; raw model "
+                "output (redacted, first 2000 chars): %s",
+                redact_secrets((raw_text or "")[:2000]),
+            )
         return ProposalPassResult(
             proposal=None,
             no_proposal_reason=(
                 f"model found no safe fix: {declination}"
-                if (declination := parse_declination(raw_text)) is not None
+                if declination is not None
                 else "model output did not match the required structured-proposal schema"
             ),
             raw_output=raw_text,
