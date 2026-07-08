@@ -595,3 +595,31 @@ def test_reaudit_gives_up_after_max_artifact_attempts(tmp_path):
     assert not verdict.passed
     assert verdict.violation == "auditor_output_unparsable"
     assert calls["n"] == _MAX_REAUDIT_ARTIFACT_ATTEMPTS
+
+
+def test_reaudit_does_not_retry_a_timeout(tmp_path):
+    """A timeout already consumed the full budget; retrying would just eat it
+    again (the wall-clock spiral). It is terminal, not retried."""
+    from dbt_fixer.reaudit import run_reaudit_gate, ProcessOutcome
+
+    (tmp_path / "models").mkdir()
+    (tmp_path / "models" / "x.yml").write_text("version: 2\n")
+    candidate = (
+        "diff --git a/models/x.yml b/models/x.yml\n"
+        "--- a/models/x.yml\n+++ b/models/x.yml\n@@ -1 +1,2 @@\n version: 2\n+# fix\n"
+    )
+    calls = {"n": 0}
+
+    def timeout_runner(args, env, cwd, timeout_seconds):
+        calls["n"] += 1
+        return ProcessOutcome(returncode=-1, stdout="", stderr="the sealed auditor timed out")
+
+    verdict = run_reaudit_gate(
+        repo_root=tmp_path, candidate_diff=candidate, pr_diff="",
+        pr_title="t", pr_description="", pr_url="u",
+        auditor_python="/fake/python", failure_kind="audit",
+        originally_failing_check_ids=(), timeout_seconds=60.0,
+        subprocess_runner=timeout_runner,
+    )
+    assert not verdict.passed
+    assert calls["n"] == 1  # NOT retried

@@ -60,9 +60,17 @@ from .scratch import ScratchCopyError, scratch_copy
 logger = logging.getLogger(__name__)
 
 # A re-audit that fails to COMPLETE is a transient artifact (Bedrock
-# throttle/timeout/no-result), not a judgment of the fix; retry it this many
+# throttle/crash/no-result), not a judgment of the fix; retry it this many
 # times before giving up. A BLOCKED verdict is never retried (see the gate).
-_MAX_REAUDIT_ARTIFACT_ATTEMPTS = 3
+# Kept low: retries only help FAST artifacts (crashes/status=failed fail in
+# seconds); a TIMEOUT is never retried (it already consumed the full budget,
+# so a second attempt would just eat it again and spiral the wall-clock).
+_MAX_REAUDIT_ARTIFACT_ATTEMPTS = 2
+
+# The subprocess runner marks a timed-out auditor with this sentinel
+# returncode (see real_reaudit_subprocess_runner). Such an outcome is a
+# completion artifact but must NOT be retried within budget.
+_TIMEOUT_RETURNCODE = -1
 
 __all__ = [
     "AuditorInvocationError",
@@ -437,7 +445,11 @@ def run_reaudit_gate(
                 completed = outcome.returncode == 0 and (
                     (parse_auditor_stdout(outcome.stdout).status or "").lower() == "completed"
                 )
-                if completed or attempt == _MAX_REAUDIT_ARTIFACT_ATTEMPTS:
+                # Retry only FAST artifacts. A timeout already burned the full
+                # budget; retrying it would just burn it again (the wall-clock
+                # spiral we are avoiding), so treat a timeout as terminal here.
+                timed_out = outcome.returncode == _TIMEOUT_RETURNCODE
+                if completed or timed_out or attempt == _MAX_REAUDIT_ARTIFACT_ATTEMPTS:
                     break
                 logger.warning(
                     "re-audit attempt %d/%d did not complete (exit=%s); retrying",
