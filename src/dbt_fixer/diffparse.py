@@ -407,6 +407,46 @@ def apply_diff(root: "str | Path", diff_text: str) -> Tuple[str, ...]:
     return tuple(sorted(block.path for block in blocks))
 
 
+def invert_diff(diff_text: str) -> str:
+    """Render the inverse of `diff_text`: applying the result to a tree in
+    the diff's AFTER state reconstructs its BEFORE state.
+
+    Structural, not textual: parse, then per file swap the a/b sides
+    (added <-> deleted), per hunk swap the old/new ranges, and per line
+    swap added <-> removed while preserving in-hunk order (the standard
+    unified-diff inversion).
+
+    Raises `DiffParseError` if `diff_text` does not parse.
+    """
+
+    out: List[str] = []
+    for block in parse_diff(diff_text):
+        path = block.path
+        out.append(f"diff --git a/{path} b/{path}\n")
+        if block.change_kind == "added":
+            out.append(f"--- a/{path}\n")
+            out.append("+++ /dev/null\n")
+        elif block.change_kind == "deleted":
+            out.append("--- /dev/null\n")
+            out.append(f"+++ b/{path}\n")
+        else:
+            out.append(f"--- a/{path}\n")
+            out.append(f"+++ b/{path}\n")
+        for hunk in block.hunks:
+            out.append(
+                f"@@ -{hunk.new_start},{hunk.new_count} +{hunk.old_start},{hunk.old_count} @@\n"
+            )
+            for line in hunk.lines:
+                text = line.text if line.text.endswith("\n") else line.text + "\n"
+                if line.kind == "added":
+                    out.append("-" + text)
+                elif line.kind == "removed":
+                    out.append("+" + text)
+                else:
+                    out.append(" " + text)
+    return "".join(out)
+
+
 def _diff_paths(diff_text: str) -> Iterable[str]:
     """Yield every file path touched by `diff_text`, without applying anything."""
 

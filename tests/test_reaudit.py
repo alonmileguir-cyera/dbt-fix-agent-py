@@ -419,23 +419,33 @@ def test_report_file_statuses_satisfy_the_efficacy_requirement(tmp_path):
     assert verdict.passed, verdict.reason
 
 
-def test_reaudit_receives_the_cumulative_diff(tmp_path):
-    """Live finding (bi-dbt #2533 round 2): a fix that edits a line the PR
-    itself added can never pass re-audit if the auditor is shown the raw PR
-    diff - it contradicts the patched repo. The re-audit must receive
-    PR diff + candidate diff combined."""
+def test_reaudit_receives_the_effective_diff(tmp_path):
+    """Live findings (bi-dbt #2533 rounds 2-3): the re-audit must judge the
+    EFFECTIVE diff, base -> (PR + fix), as one clean change. A fix that
+    rewrites a PR-added line must appear in the effective diff as if the
+    author had written the fixed line in the first place - the PR's broken
+    version of the line must not appear at all."""
     from dbt_fixer.reaudit import run_reaudit_gate, ProcessOutcome
 
+    # repo_root is the PR HEAD: it contains the PR's added files.
     (tmp_path / "models").mkdir()
-    (tmp_path / "models" / "x.yml").write_text("version: 2\n")
-    candidate = (
-        "diff --git a/models/x.yml b/models/x.yml\n"
-        "--- a/models/x.yml\n+++ b/models/x.yml\n"
-        "@@ -1 +1,2 @@\n version: 2\n+# fix\n"
+    (tmp_path / "models" / "y.sql").write_text("select 1 as id\n")
+    (tmp_path / "models" / "x.yml").write_text(
+        "version: 2\nmodels:\n  - name: y\n    columns:\n      - name: team_uid\n"
     )
     pr_diff = (
         "diff --git a/models/y.sql b/models/y.sql\n"
-        "--- /dev/null\n+++ b/models/y.sql\n@@ -0,0 +1 @@\n+select 1\n"
+        "--- /dev/null\n+++ b/models/y.sql\n@@ -0,0 +1 @@\n+select 1 as id\n"
+        "diff --git a/models/x.yml b/models/x.yml\n"
+        "--- /dev/null\n+++ b/models/x.yml\n@@ -0,0 +1,5 @@\n"
+        "+version: 2\n+models:\n+  - name: y\n+    columns:\n+      - name: team_uid\n"
+    )
+    # the fix rewrites the PR-added phantom column
+    candidate = (
+        "diff --git a/models/x.yml b/models/x.yml\n"
+        "--- a/models/x.yml\n+++ b/models/x.yml\n"
+        "@@ -1,5 +1,5 @@\n version: 2\n models:\n   - name: y\n     columns:\n"
+        "-      - name: team_uid\n+      - name: id\n"
     )
     seen = {}
 
@@ -454,9 +464,30 @@ def test_reaudit_receives_the_cumulative_diff(tmp_path):
         originally_failing_check_ids=(), timeout_seconds=60.0,
         subprocess_runner=fake_runner,
     )
-    assert "models/y.sql" in seen["diff"]   # the PR's own change
-    assert "+# fix" in seen["diff"]          # AND the candidate's change
-    assert seen["diff"].index("y.sql") < seen["diff"].index("+# fix")
+    diff = seen["diff"]
+    assert "models/y.sql" in diff              # the PR's own added file
+    assert "+      - name: id" in diff         # the FIXED line, as a clean addition
+    assert "team_uid" not in diff              # the broken version never appears
+    assert diff.count("diff --git a/models/x.yml") == 1  # one clean block per file
+
+
+def test_invert_diff_round_trips(tmp_path):
+    from dbt_fixer.diffparse import apply_diff, invert_diff
+
+    (tmp_path / "m").mkdir()
+    (tmp_path / "m" / "a.sql").write_text("select 1\n")
+    diff = (
+        "diff --git a/m/a.sql b/m/a.sql\n--- a/m/a.sql\n+++ b/m/a.sql\n"
+        "@@ -1 +1 @@\n-select 1\n+select 2\n"
+        "diff --git a/m/new.yml b/m/new.yml\n--- /dev/null\n+++ b/m/new.yml\n"
+        "@@ -0,0 +1 @@\n+version: 2\n"
+    )
+    apply_diff(tmp_path, diff)
+    assert (tmp_path / "m" / "a.sql").read_text() == "select 2\n"
+    assert (tmp_path / "m" / "new.yml").exists()
+    apply_diff(tmp_path, invert_diff(diff))
+    assert (tmp_path / "m" / "a.sql").read_text() == "select 1\n"
+    assert not (tmp_path / "m" / "new.yml").exists()
 
 
 def test_combine_diffs_handles_empty_sides():

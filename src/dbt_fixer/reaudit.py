@@ -43,6 +43,7 @@ absence for a `kind="ci"` run (which never needs it) is not an error.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -52,6 +53,8 @@ from typing import Callable, Dict, Mapping, Optional, Tuple
 from .diffparse import DiffParseError, PatchApplyError, apply_diff
 from .env import FailureKind
 from .intake import AUDIT_CHECK_ENTRY_RE, FAILING_STATUS_TOKENS
+
+logger = logging.getLogger(__name__)
 from .pathsafe import PathTraversalError
 from .scratch import ScratchCopyError, scratch_copy
 
@@ -186,6 +189,38 @@ _AMBIENT_PASSTHROUGH_KEYS = (
     "SSL_CERT_FILE",
     "REQUESTS_CA_BUNDLE",
 )
+
+
+def build_effective_diff(
+    *, repo_root: "str | Path", final_root: "str | Path", pr_diff: str, candidate_diff: str
+) -> str:
+    """The diff the re-audit should judge: base -> (PR + fix), as ONE clean
+    change - exactly what the PR would look like had the author pushed the
+    fix themselves.
+
+    Raw PR diff contradicts the patched repo (live finding, bi-dbt #2533
+    round 2); concatenating PR + candidate makes the fix read as deleting
+    the PR's tested lines - the exact "weakening" pattern the auditor is
+    primed to block (round 3). The effective diff has neither problem.
+
+    Reconstruction is pure Python: `repo_root` is the PR-head checkout, so
+    applying the INVERSE of the PR diff to a scratch copy of it yields the
+    base tree for every touched file; `final_root` (the candidate-patched
+    scratch) is the after state; `generate_unified_diff` renders base ->
+    final for the union of touched paths.
+
+    Raises on any parse/apply failure - the caller falls back to the
+    cumulative concatenation, which is imperfect but never contradictory.
+    """
+
+    from .diffing import generate_unified_diff
+    from .diffparse import invert_diff, _diff_paths, apply_diff as _apply
+
+    touched = sorted(set(_diff_paths(pr_diff)) | set(_diff_paths(candidate_diff)))
+    with scratch_copy(Path(repo_root)) as base_root:
+        if pr_diff.strip():
+            _apply(base_root, invert_diff(pr_diff))
+        return generate_unified_diff(base_root, final_root, touched)
 
 
 def combine_diffs(pr_diff: str, candidate_diff: str) -> str:
@@ -334,18 +369,27 @@ def run_reaudit_gate(
             os.close(report_fd)
             report_text = ""
             try:
-                # The re-audit's question is "would this PR, WITH the fix
-                # applied, pass?" - so the injected "what actually changed"
-                # must be the CUMULATIVE diff (PR + candidate). Passing the
-                # raw PR diff alone contradicts the patched scratch repo
-                # whenever the fix edits a line the PR itself added: the
-                # auditor sees the PR's broken hunk as authoritative and
-                # re-blocks on state that no longer exists (first observed
-                # live on bi-dbt #2533 round 2 - a yml column rename could
-                # never satisfy the gate).
+                # The re-audit judges the EFFECTIVE diff: base -> (PR+fix)
+                # as one clean change. See build_effective_diff for why the
+                # two simpler choices both produced false blocks in
+                # production (bi-dbt #2533 rounds 2 and 3).
+                try:
+                    reaudit_diff = build_effective_diff(
+                        repo_root=repo_root,
+                        final_root=scratch_root,
+                        pr_diff=pr_diff,
+                        candidate_diff=candidate_diff,
+                    )
+                except Exception as exc:  # noqa: BLE001 - presentation fallback
+                    logger.warning(
+                        "re-audit: could not build the effective diff (%s); "
+                        "falling back to the cumulative PR+candidate diff",
+                        exc,
+                    )
+                    reaudit_diff = combine_diffs(pr_diff, candidate_diff)
                 env = build_auditor_env(
                     repo_path=scratch_root,
-                    pr_diff=combine_diffs(pr_diff, candidate_diff),
+                    pr_diff=reaudit_diff,
                     pr_title=pr_title,
                     pr_description=pr_description,
                     pr_url=pr_url,
