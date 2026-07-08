@@ -188,6 +188,15 @@ _AMBIENT_PASSTHROUGH_KEYS = (
 )
 
 
+def combine_diffs(pr_diff: str, candidate_diff: str) -> str:
+    """Concatenate the PR diff and the candidate diff into one cumulative
+    unified diff (later hunks describe changes applied on top of earlier
+    ones - the same way sequential commits read)."""
+
+    parts = [d.strip("\n") for d in (pr_diff, candidate_diff) if d and d.strip()]
+    return "\n".join(parts) + ("\n" if parts else "")
+
+
 def build_auditor_args(auditor_python: str) -> list:
     """Build the subprocess argv for invoking the sealed auditor as a module."""
 
@@ -325,9 +334,18 @@ def run_reaudit_gate(
             os.close(report_fd)
             report_text = ""
             try:
+                # The re-audit's question is "would this PR, WITH the fix
+                # applied, pass?" - so the injected "what actually changed"
+                # must be the CUMULATIVE diff (PR + candidate). Passing the
+                # raw PR diff alone contradicts the patched scratch repo
+                # whenever the fix edits a line the PR itself added: the
+                # auditor sees the PR's broken hunk as authoritative and
+                # re-blocks on state that no longer exists (first observed
+                # live on bi-dbt #2533 round 2 - a yml column rename could
+                # never satisfy the gate).
                 env = build_auditor_env(
                     repo_path=scratch_root,
-                    pr_diff=pr_diff,
+                    pr_diff=combine_diffs(pr_diff, candidate_diff),
                     pr_title=pr_title,
                     pr_description=pr_description,
                     pr_url=pr_url,

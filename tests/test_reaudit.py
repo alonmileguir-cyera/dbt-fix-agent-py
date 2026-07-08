@@ -417,3 +417,52 @@ def test_report_file_statuses_satisfy_the_efficacy_requirement(tmp_path):
         subprocess_runner=fake_runner,
     )
     assert verdict.passed, verdict.reason
+
+
+def test_reaudit_receives_the_cumulative_diff(tmp_path):
+    """Live finding (bi-dbt #2533 round 2): a fix that edits a line the PR
+    itself added can never pass re-audit if the auditor is shown the raw PR
+    diff - it contradicts the patched repo. The re-audit must receive
+    PR diff + candidate diff combined."""
+    from dbt_fixer.reaudit import run_reaudit_gate, ProcessOutcome
+
+    (tmp_path / "models").mkdir()
+    (tmp_path / "models" / "x.yml").write_text("version: 2\n")
+    candidate = (
+        "diff --git a/models/x.yml b/models/x.yml\n"
+        "--- a/models/x.yml\n+++ b/models/x.yml\n"
+        "@@ -1 +1,2 @@\n version: 2\n+# fix\n"
+    )
+    pr_diff = (
+        "diff --git a/models/y.sql b/models/y.sql\n"
+        "--- /dev/null\n+++ b/models/y.sql\n@@ -0,0 +1 @@\n+select 1\n"
+    )
+    seen = {}
+
+    def fake_runner(args, env, cwd, timeout_seconds):
+        seen["diff"] = env["DBT_AUDITOR_PR_DIFF"]
+        return ProcessOutcome(
+            returncode=0,
+            stdout="dbt-auditor verdict: PASSED - ok\ndbt-auditor-audit-status: completed\n",
+            stderr="",
+        )
+
+    run_reaudit_gate(
+        repo_root=tmp_path, candidate_diff=candidate, pr_diff=pr_diff,
+        pr_title="t", pr_description="", pr_url="u",
+        auditor_python="/fake/python", failure_kind="audit",
+        originally_failing_check_ids=(), timeout_seconds=60.0,
+        subprocess_runner=fake_runner,
+    )
+    assert "models/y.sql" in seen["diff"]   # the PR's own change
+    assert "+# fix" in seen["diff"]          # AND the candidate's change
+    assert seen["diff"].index("y.sql") < seen["diff"].index("+# fix")
+
+
+def test_combine_diffs_handles_empty_sides():
+    from dbt_fixer.reaudit import combine_diffs
+
+    assert combine_diffs("", "") == ""
+    assert combine_diffs("a\n", "") == "a\n"
+    assert combine_diffs("", "b\n") == "b\n"
+    assert combine_diffs("a\n\n", "b") == "a\nb\n"
