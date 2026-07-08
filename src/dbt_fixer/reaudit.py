@@ -172,7 +172,12 @@ def build_auditor_env(
             "DBT_AUDITOR_PR_DESCRIPTION": pr_description,
             "DBT_AUDITOR_PR_URL": pr_url,
             "DBT_AUDITOR_SHADOW_MODE": "true",
-            "DBT_AUDITOR_TIMEOUT_SECONDS": "600",
+            # 900s, not 600s: in CI (slower runner + Bedrock throttling on a
+            # minimal role) the inner audit consistently hit a 600s budget
+            # and self-reported status=failed at ~12 min, cascading through
+            # retries into a ~46-min run (bi-dbt #2533 round 9). Letting the
+            # single audit COMPLETE is faster overall than failing + retrying.
+            "DBT_AUDITOR_TIMEOUT_SECONDS": "900",
             "DBT_AUDITOR_MAX_TURNS": "25",
             "DBT_AUDITOR_MAX_TOOL_CALLS": "50",
         }
