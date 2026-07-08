@@ -48,6 +48,7 @@ reported -- this function never accumulates or ranks multiple violations):
 from __future__ import annotations
 
 import re
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
@@ -228,9 +229,20 @@ def _check_test_weakening(
         suffix = Path(block.path).suffix.lower()
         if suffix not in (".yml", ".yaml"):
             continue
+        # A removed test line that is re-added VERBATIM (modulo whitespace)
+        # in the same file is a MOVE - the column-rename fix shape (live
+        # finding, bi-dbt #2533 round 4: renaming a mis-declared column
+        # re-lists its identical tests under the new name and was rejected
+        # as a deletion). Only NET removals are weakening; whether the move
+        # itself is sound stays the re-audit's and refuter's call.
+        readded = Counter(line.strip() for line in block.added_lines())
         for removed_line in block.removed_lines():
             test_desc = _is_test_related_removed_line(removed_line)
             if test_desc is None:
+                continue
+            normalized = removed_line.strip()
+            if readded[normalized] > 0:
+                readded[normalized] -= 1
                 continue
 
             if failure_kind == "ci":

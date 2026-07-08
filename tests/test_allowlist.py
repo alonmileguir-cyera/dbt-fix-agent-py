@@ -389,3 +389,113 @@ def test_paths_outside_any_models_tree_still_rejected():
     blocks = parse_diff(diff)
     verdict = _check_file_types(blocks)
     assert verdict is not None and not verdict.passed
+
+
+# ---------------------------------------------------------------------------
+# moved-test exemption (live finding: bi-dbt #2533 round 4)
+# ---------------------------------------------------------------------------
+
+
+def _rename_diff():
+    return (
+        "diff --git a/proj/models/staging/_x__models.yml b/proj/models/staging/_x__models.yml\n"
+        "--- a/proj/models/staging/_x__models.yml\n"
+        "+++ b/proj/models/staging/_x__models.yml\n"
+        "@@ -1,8 +1,8 @@\n"
+        " version: 2\n"
+        " models:\n"
+        "   - name: m\n"
+        "     columns:\n"
+        "-      - name: team_uid\n"
+        "+      - name: id\n"
+        "         tests:\n"
+        "-          - unique\n"
+        "-          - not_null\n"
+        "+          - unique\n"
+        "+          - not_null\n"
+    )
+
+
+def test_column_rename_with_identical_tests_is_a_move_not_a_deletion(tmp_path):
+    """Renaming a mis-declared column re-lists its identical tests under
+    the new name; that must clear the allowlist under BOTH kinds."""
+    repo = _make_repo(tmp_path, {
+        "proj/models/staging/_x__models.yml": (
+            "version: 2\nmodels:\n  - name: m\n    columns:\n"
+            "      - name: team_uid\n        tests:\n"
+            "          - unique\n          - not_null\n"
+        ),
+    })
+    for kind in ("audit", "ci"):
+        verdict = run_allowlist_gate(
+            repo_root=repo,
+            candidate_diff=_rename_diff(),
+            pr_diff="",
+            failure_kind=kind,
+            caps=DEFAULT_CAPS,
+        )
+        assert verdict.passed, f"kind={kind}: {verdict.reason}"
+
+
+def test_net_test_deletion_is_still_rejected(tmp_path):
+    """Removing a test WITHOUT re-adding it stays rejected (no evidence)."""
+
+    diff = (
+        "diff --git a/proj/models/staging/_x__models.yml b/proj/models/staging/_x__models.yml\n"
+        "--- a/proj/models/staging/_x__models.yml\n"
+        "+++ b/proj/models/staging/_x__models.yml\n"
+        "@@ -1,6 +1,5 @@\n"
+        " version: 2\n"
+        " models:\n"
+        "   - name: m\n"
+        "     columns:\n"
+        "       - name: id\n"
+        "-          - not_null\n"
+    )
+    repo = _make_repo(tmp_path, {
+        "proj/models/staging/_x__models.yml": (
+            "version: 2\nmodels:\n  - name: m\n    columns:\n"
+            "      - name: id\n          - not_null\n"
+        ),
+    })
+    for kind in ("audit", "ci"):
+        verdict = run_allowlist_gate(
+            repo_root=repo, candidate_diff=diff, pr_diff="",
+            failure_kind=kind, caps=DEFAULT_CAPS,
+        )
+        assert not verdict.passed, f"kind={kind} should reject a net deletion"
+
+
+def test_move_exemption_is_count_bounded(tmp_path):
+    """Removing a test twice while re-adding it once: one removal is a
+    move, the second is a net deletion and still rejected."""
+
+    diff = (
+        "diff --git a/proj/models/staging/_x__models.yml b/proj/models/staging/_x__models.yml\n"
+        "--- a/proj/models/staging/_x__models.yml\n"
+        "+++ b/proj/models/staging/_x__models.yml\n"
+        "@@ -1,10 +1,7 @@\n"
+        " version: 2\n"
+        " models:\n"
+        "   - name: m\n"
+        "     columns:\n"
+        "       - name: a\n"
+        "-          - not_null\n"
+        "       - name: b\n"
+        "-          - not_null\n"
+        "       - name: c\n"
+        "+          - not_null\n"
+    )
+    repo = _make_repo(tmp_path, {
+        "proj/models/staging/_x__models.yml": (
+            "version: 2\nmodels:\n  - name: m\n    columns:\n"
+            "      - name: a\n          - not_null\n"
+            "      - name: b\n          - not_null\n"
+            "      - name: c\n"
+        ),
+    })
+    verdict = run_allowlist_gate(
+        repo_root=repo, candidate_diff=diff, pr_diff="",
+        failure_kind="audit", caps=DEFAULT_CAPS,
+    )
+    assert not verdict.passed
