@@ -345,7 +345,7 @@ def test_auditor_env_passes_credentials_knobs_and_report_path(monkeypatch):
     assert env["AWS_REGION"] == "us-east-1"
     assert env["AWS_WEB_IDENTITY_TOKEN_FILE"] == "/var/run/tok"
     assert "NOT_ALLOWED" not in env
-    assert env["DBT_AUDITOR_TIMEOUT_SECONDS"] == "600"
+    assert env["DBT_AUDITOR_TIMEOUT_SECONDS"] == "900"
     assert env["DBT_AUDITOR_MAX_TOOL_CALLS"] == "50"
     assert env["DBT_AUDITOR_REPORT_PATH"] == "/tmp/r.md"
     assert "DBT_AUDITOR_SLACK_CHANNEL" not in env
