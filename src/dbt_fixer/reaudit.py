@@ -403,6 +403,26 @@ def run_reaudit_gate(
                 )
                 reaudit_diff = combine_diffs(pr_diff, candidate_diff)
 
+            # An EMPTY effective diff means the candidate fully reverts the
+            # PR's flagged change (PR + fix == base), so there is no residual
+            # change to audit and no residual risk - the originally-failing
+            # checks are vacuously satisfied. Auditing an empty diff yields no
+            # check results, which the auditor reports as a fail-closed
+            # ARTIFACT; short-circuit to PASS instead. (A no-op *candidate* is
+            # already rejected upstream by the allowlist, so an empty
+            # *effective* diff here always means a genuine full revert - the
+            # correct fix for e.g. a downstream break caused purely by a
+            # removal. Found via the downstream-restore coverage test.)
+            if not reaudit_diff.strip():
+                return ReAuditVerdict(
+                    passed=True,
+                    reason=(
+                        "the candidate fully reverts the PR's flagged change "
+                        "(empty effective diff); nothing remains to audit"
+                    ),
+                    checked_identifiers=tuple(originally_failing_check_ids),
+                )
+
             # A re-audit that fails to COMPLETE (nonzero exit, timeout, or a
             # 'status != completed' artifact) is a failure to JUDGE, not a
             # judgment, so it is retried a bounded number of times - mirroring

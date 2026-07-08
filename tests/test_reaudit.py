@@ -623,3 +623,40 @@ def test_reaudit_does_not_retry_a_timeout(tmp_path):
     )
     assert not verdict.passed
     assert calls["n"] == 1  # NOT retried
+
+
+def test_reaudit_passes_when_fix_fully_reverts_the_pr(tmp_path):
+    """A fix that restores exactly what the PR removed yields an empty
+    effective diff (PR + fix == base). The gate must PASS without invoking
+    the auditor (auditing an empty diff would fail-closed as an artifact).
+    Found via the downstream-restore coverage test."""
+    from dbt_fixer.reaudit import run_reaudit_gate, ProcessOutcome
+
+    (tmp_path / "models").mkdir()
+    # base/repo_root is the PR HEAD: the PR removed a line ('b')
+    (tmp_path / "models" / "m.sql").write_text("a\nc\n")
+    pr_diff = (
+        "diff --git a/models/m.sql b/models/m.sql\n"
+        "--- a/models/m.sql\n+++ b/models/m.sql\n@@ -1,3 +1,2 @@\n a\n-b\n c\n"
+    )
+    # candidate restores 'b' -> PR+fix == base -> empty effective diff
+    candidate = (
+        "diff --git a/models/m.sql b/models/m.sql\n"
+        "--- a/models/m.sql\n+++ b/models/m.sql\n@@ -1,2 +1,3 @@\n a\n+b\n c\n"
+    )
+    called = {"n": 0}
+
+    def runner(args, env, cwd, timeout_seconds):
+        called["n"] += 1
+        return ProcessOutcome(returncode=0, stdout="dbt-auditor-audit-status: failed\n", stderr="")
+
+    verdict = run_reaudit_gate(
+        repo_root=tmp_path, candidate_diff=candidate, pr_diff=pr_diff,
+        pr_title="t", pr_description="", pr_url="u",
+        auditor_python="/fake/python", failure_kind="audit",
+        originally_failing_check_ids=("downstream_dependency_impact",),
+        timeout_seconds=60.0, subprocess_runner=runner,
+    )
+    assert verdict.passed, verdict.reason
+    assert "reverts" in verdict.reason
+    assert called["n"] == 0  # auditor never invoked on an empty effective diff
