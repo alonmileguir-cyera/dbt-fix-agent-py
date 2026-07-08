@@ -497,3 +497,101 @@ def test_combine_diffs_handles_empty_sides():
     assert combine_diffs("a\n", "") == "a\n"
     assert combine_diffs("", "b\n") == "b\n"
     assert combine_diffs("a\n\n", "b") == "a\nb\n"
+
+
+def test_reaudit_retries_a_completion_artifact_then_succeeds(tmp_path):
+    """A 'status=failed' artifact is a failure to judge, not a rejection:
+    the gate retries and accepts a subsequent COMPLETED, non-blocked run.
+    (Live finding: bi-dbt #2533 hit a transient re-audit artifact on an
+    otherwise-sound fix.)"""
+    from dbt_fixer.reaudit import run_reaudit_gate, ProcessOutcome
+
+    (tmp_path / "models").mkdir()
+    (tmp_path / "models" / "x.yml").write_text("version: 2\n")
+    candidate = (
+        "diff --git a/models/x.yml b/models/x.yml\n"
+        "--- a/models/x.yml\n+++ b/models/x.yml\n@@ -1 +1,2 @@\n version: 2\n+# fix\n"
+    )
+    calls = {"n": 0}
+
+    def flaky_runner(args, env, cwd, timeout_seconds):
+        calls["n"] += 1
+        if calls["n"] == 1:  # transient artifact
+            return ProcessOutcome(
+                returncode=0,
+                stdout="dbt-auditor-audit-status: failed\n",
+                stderr="",
+            )
+        return ProcessOutcome(  # completes cleanly on retry
+            returncode=0,
+            stdout="dbt-auditor verdict: PASSED - ok\ndbt-auditor-audit-status: completed\n",
+            stderr="",
+        )
+
+    verdict = run_reaudit_gate(
+        repo_root=tmp_path, candidate_diff=candidate, pr_diff="",
+        pr_title="t", pr_description="", pr_url="u",
+        auditor_python="/fake/python", failure_kind="audit",
+        originally_failing_check_ids=(), timeout_seconds=60.0,
+        subprocess_runner=flaky_runner,
+    )
+    assert verdict.passed, verdict.reason
+    assert calls["n"] == 2  # retried once, then accepted
+
+
+def test_reaudit_does_not_retry_a_genuine_blocked_verdict(tmp_path):
+    """A BLOCKED verdict is a real judgment - it must NOT be retried."""
+    from dbt_fixer.reaudit import run_reaudit_gate, ProcessOutcome
+
+    (tmp_path / "models").mkdir()
+    (tmp_path / "models" / "x.yml").write_text("version: 2\n")
+    candidate = (
+        "diff --git a/models/x.yml b/models/x.yml\n"
+        "--- a/models/x.yml\n+++ b/models/x.yml\n@@ -1 +1,2 @@\n version: 2\n+# fix\n"
+    )
+    calls = {"n": 0}
+
+    def blocking_runner(args, env, cwd, timeout_seconds):
+        calls["n"] += 1
+        return ProcessOutcome(
+            returncode=0,
+            stdout="dbt-auditor verdict: BLOCKED - nope\ndbt-auditor-audit-status: completed\n",
+            stderr="",
+        )
+
+    verdict = run_reaudit_gate(
+        repo_root=tmp_path, candidate_diff=candidate, pr_diff="",
+        pr_title="t", pr_description="", pr_url="u",
+        auditor_python="/fake/python", failure_kind="audit",
+        originally_failing_check_ids=(), timeout_seconds=60.0,
+        subprocess_runner=blocking_runner,
+    )
+    assert not verdict.passed
+    assert calls["n"] == 1  # BLOCKED is a judgment, not retried
+
+
+def test_reaudit_gives_up_after_max_artifact_attempts(tmp_path):
+    from dbt_fixer.reaudit import run_reaudit_gate, ProcessOutcome, _MAX_REAUDIT_ARTIFACT_ATTEMPTS
+
+    (tmp_path / "models").mkdir()
+    (tmp_path / "models" / "x.yml").write_text("version: 2\n")
+    candidate = (
+        "diff --git a/models/x.yml b/models/x.yml\n"
+        "--- a/models/x.yml\n+++ b/models/x.yml\n@@ -1 +1,2 @@\n version: 2\n+# fix\n"
+    )
+    calls = {"n": 0}
+
+    def always_artifact(args, env, cwd, timeout_seconds):
+        calls["n"] += 1
+        return ProcessOutcome(returncode=0, stdout="dbt-auditor-audit-status: failed\n", stderr="")
+
+    verdict = run_reaudit_gate(
+        repo_root=tmp_path, candidate_diff=candidate, pr_diff="",
+        pr_title="t", pr_description="", pr_url="u",
+        auditor_python="/fake/python", failure_kind="audit",
+        originally_failing_check_ids=(), timeout_seconds=60.0,
+        subprocess_runner=always_artifact,
+    )
+    assert not verdict.passed
+    assert verdict.violation == "auditor_output_unparsable"
+    assert calls["n"] == _MAX_REAUDIT_ARTIFACT_ATTEMPTS

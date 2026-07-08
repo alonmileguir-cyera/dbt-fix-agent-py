@@ -54,9 +54,15 @@ from .diffparse import DiffParseError, PatchApplyError, apply_diff
 from .env import FailureKind
 from .intake import AUDIT_CHECK_ENTRY_RE, FAILING_STATUS_TOKENS
 
-logger = logging.getLogger(__name__)
 from .pathsafe import PathTraversalError
 from .scratch import ScratchCopyError, scratch_copy
+
+logger = logging.getLogger(__name__)
+
+# A re-audit that fails to COMPLETE is a transient artifact (Bedrock
+# throttle/timeout/no-result), not a judgment of the fix; retry it this many
+# times before giving up. A BLOCKED verdict is never retried (see the gate).
+_MAX_REAUDIT_ARTIFACT_ATTEMPTS = 3
 
 __all__ = [
     "AuditorInvocationError",
@@ -363,59 +369,82 @@ def run_reaudit_gate(
                     reason=f"candidate diff could not be applied for re-audit: {exc}",
                 )
 
+            args = build_auditor_args(auditor_python)
+
+            # The re-audit judges the EFFECTIVE diff: base -> (PR+fix) as one
+            # clean change. See build_effective_diff for why the two simpler
+            # choices both produced false blocks in production (bi-dbt #2533
+            # rounds 2 and 3). Deterministic, so built once outside the loop.
+            try:
+                reaudit_diff = build_effective_diff(
+                    repo_root=repo_root,
+                    final_root=scratch_root,
+                    pr_diff=pr_diff,
+                    candidate_diff=candidate_diff,
+                )
+            except Exception as exc:  # noqa: BLE001 - presentation fallback
+                logger.warning(
+                    "re-audit: could not build the effective diff (%s); "
+                    "falling back to the cumulative PR+candidate diff",
+                    exc,
+                )
+                reaudit_diff = combine_diffs(pr_diff, candidate_diff)
+
+            # A re-audit that fails to COMPLETE (nonzero exit, timeout, or a
+            # 'status != completed' artifact) is a failure to JUDGE, not a
+            # judgment, so it is retried a bounded number of times - mirroring
+            # the sealed auditor's own artifact-retry philosophy (bi-dbt #2533
+            # hit a transient artifact on an otherwise-sound fix). A BLOCKED
+            # verdict or a still-failing named check is a real judgment and is
+            # never retried here: the loop breaks on the first COMPLETED run,
+            # and the classification below handles every terminal case.
             import tempfile
 
-            report_fd, report_file = tempfile.mkstemp(suffix=".md", prefix="dbt-reaudit-")
-            os.close(report_fd)
+            outcome = None
             report_text = ""
-            try:
-                # The re-audit judges the EFFECTIVE diff: base -> (PR+fix)
-                # as one clean change. See build_effective_diff for why the
-                # two simpler choices both produced false blocks in
-                # production (bi-dbt #2533 rounds 2 and 3).
+            for attempt in range(1, _MAX_REAUDIT_ARTIFACT_ATTEMPTS + 1):
+                report_fd, report_file = tempfile.mkstemp(suffix=".md", prefix="dbt-reaudit-")
+                os.close(report_fd)
                 try:
-                    reaudit_diff = build_effective_diff(
-                        repo_root=repo_root,
-                        final_root=scratch_root,
-                        pr_diff=pr_diff,
-                        candidate_diff=candidate_diff,
+                    env = build_auditor_env(
+                        repo_path=scratch_root,
+                        pr_diff=reaudit_diff,
+                        pr_title=pr_title,
+                        pr_description=pr_description,
+                        pr_url=pr_url,
+                        report_path=report_file,
                     )
-                except Exception as exc:  # noqa: BLE001 - presentation fallback
-                    logger.warning(
-                        "re-audit: could not build the effective diff (%s); "
-                        "falling back to the cumulative PR+candidate diff",
-                        exc,
-                    )
-                    reaudit_diff = combine_diffs(pr_diff, candidate_diff)
-                env = build_auditor_env(
-                    repo_path=scratch_root,
-                    pr_diff=reaudit_diff,
-                    pr_title=pr_title,
-                    pr_description=pr_description,
-                    pr_url=pr_url,
-                    report_path=report_file,
-                )
-                args = build_auditor_args(auditor_python)
+                    try:
+                        outcome = subprocess_runner(args, env, scratch_root, timeout_seconds)
+                    except AuditorInvocationError as exc:
+                        return ReAuditVerdict(
+                            passed=False,
+                            hard_no_safe_fix=True,
+                            violation="auditor_interpreter_missing",
+                            reason=f"the sealed auditor could not be invoked: {exc}",
+                        )
+                    try:
+                        with open(report_file, "r", encoding="utf-8") as handle:
+                            report_text = handle.read()
+                    except OSError:
+                        report_text = ""
+                finally:
+                    try:
+                        os.unlink(report_file)
+                    except OSError:
+                        pass
 
-                try:
-                    outcome = subprocess_runner(args, env, scratch_root, timeout_seconds)
-                except AuditorInvocationError as exc:
-                    return ReAuditVerdict(
-                        passed=False,
-                        hard_no_safe_fix=True,
-                        violation="auditor_interpreter_missing",
-                        reason=f"the sealed auditor could not be invoked: {exc}",
-                    )
-                try:
-                    with open(report_file, "r", encoding="utf-8") as handle:
-                        report_text = handle.read()
-                except OSError:
-                    report_text = ""
-            finally:
-                try:
-                    os.unlink(report_file)
-                except OSError:
-                    pass
+                completed = outcome.returncode == 0 and (
+                    (parse_auditor_stdout(outcome.stdout).status or "").lower() == "completed"
+                )
+                if completed or attempt == _MAX_REAUDIT_ARTIFACT_ATTEMPTS:
+                    break
+                logger.warning(
+                    "re-audit attempt %d/%d did not complete (exit=%s); retrying",
+                    attempt,
+                    _MAX_REAUDIT_ARTIFACT_ATTEMPTS,
+                    outcome.returncode,
+                )
     except ScratchCopyError as exc:
         return ReAuditVerdict(
             passed=False,
