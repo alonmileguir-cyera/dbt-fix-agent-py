@@ -262,6 +262,18 @@ def test_real_blocked_report_parses_failing_checks_with_evidence():
     assert "unique and not_null" in target.checks[0].evidence
 
 
+def test_real_failed_banner_report_is_still_fixable():
+    """Cross-package contract: the auditor's report-only banner reads
+    '**FAILED**' (not '**BLOCKED**') because it never gates a merge, while the
+    Verdict enum stays BLOCKED. The fixer must still recognize such a report as
+    a fixable target - it keys only on 'not PASSED' + a FAIL check, and the
+    all-caps 'FAILED' parses cleanly under the [A-Z_]+ verdict regex."""
+    failed_banner = REAL_BLOCKED_REPORT.replace("**BLOCKED**", "**FAILED**")
+    target, reason = parse_failure_target("audit", failed_banner)
+    assert reason is None and target is not None
+    assert [c.identifier for c in target.checks] == ["schema_contract_verification"]
+
+
 def test_real_artifact_report_is_rejected_not_fixed():
     target, reason = parse_failure_target("audit", REAL_ARTIFACT_REPORT)
     assert target is None
