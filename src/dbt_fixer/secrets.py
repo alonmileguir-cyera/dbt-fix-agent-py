@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # The AWS Secrets Manager secret id the Slack bot token is read from. The
 # bi-automations house bot (same one the dbt triage agent uses) - it carries the
 # chat:write.customize scope, so the fixer can post under a custom sender name.
-SLACK_TOKEN_SECRET_ID = "bi-automations-bot-token"
+SLACK_TOKEN_SECRET_ID = "cyera-bi/bi-automations-bot-token"
 
 # Environment variable fallback, consulted whenever Secrets Manager
 # retrieval is unavailable or fails for any reason.
