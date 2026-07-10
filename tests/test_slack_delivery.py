@@ -542,10 +542,11 @@ def test_summary_includes_problem_line_when_provided():
         failure_kind="audit",
         pr_url="https://example.com/pr/1",
         candidate_diff="",
-        problem_summary="`schema_contract_verification` -- yml declares a column the model omits",
+        problem_summary="- `schema_contract_verification` — yml declares a column the model omits",
     )
+    # Label on its own line, then the bullet(s).
     assert (
-        "*Problem:* `schema_contract_verification` -- yml declares a column the model omits"
+        "*Problem:*\n- `schema_contract_verification` — yml declares a column the model omits"
         in text
     )
     # Problem sits between the failure kind and the reason.

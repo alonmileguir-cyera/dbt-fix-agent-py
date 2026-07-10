@@ -193,8 +193,10 @@ def _build_summary_text(
 ) -> str:
     glyph = run_result.glyph()
     pr_line = f"*PR:* {pr_url.strip()}\n" if pr_url and pr_url.strip() else ""
+    # Label on its own line, then the per-check bullets, so a multi-check
+    # summary lays out as a list rather than a run-on after "*Problem:*".
     problem_line = (
-        f"*Problem:* {problem_summary.strip()}\n"
+        f"*Problem:*\n{problem_summary.strip()}\n"
         if problem_summary and problem_summary.strip()
         else ""
     )

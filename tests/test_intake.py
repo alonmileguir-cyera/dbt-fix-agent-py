@@ -343,11 +343,12 @@ def test_problem_summary_names_checks_with_evidence_and_leads_with_blocking():
         ),
     )
     summary = target.problem_summary
-    # Blocking (critical) check leads; advisory is appended.
+    lines = summary.splitlines()
+    # One `- ` bullet per check; blocking (critical) check leads, advisory after.
+    assert all(l.startswith("- ") for l in lines)
     assert summary.index("schema_contract_verification") < summary.index("sql_style")
-    # Evidence is whitespace-collapsed onto one line.
-    assert "yml declares col `x` the model omits" in summary
-    assert "\n" not in summary
+    # Evidence reduced to its first point, marker-free, on that check's line.
+    assert "yml declares" in summary
 
 
 def test_problem_summary_truncates_long_evidence_and_caps_checks():
@@ -369,4 +370,4 @@ def test_problem_summary_handles_no_evidence():
     from dbt_fixer.intake import FailingCheck, FailureTarget
 
     target = FailureTarget(kind="ci", checks=(FailingCheck(identifier="my_test"),))
-    assert target.problem_summary == "`my_test`"
+    assert target.problem_summary == "- `my_test`"
