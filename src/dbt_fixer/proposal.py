@@ -338,10 +338,36 @@ def render_preloaded_files(repo_root: "str | Path", paths: Sequence[str]) -> str
     )
 
 
+def _render_blocking_scope(blocking_scope: Optional[Sequence[str]]) -> Optional[str]:
+    """A scope directive naming ONLY the blocking checks the fixer may address.
+
+    The failure context handed to the model can also carry advisory findings
+    (e.g. a now-advisory destructive operation, or SQL-style gaps). The fixer is
+    responsible for blocking checks only - advisory findings are for human
+    review and the allowlist forbids the edits that would clear them anyway - so
+    this tells the model to fix the listed checks and leave everything else
+    untouched, keeping it from ever proposing an edit to an advisory finding.
+    ``None``/empty renders nothing (existing callers are unchanged)."""
+
+    ids = [s for s in (blocking_scope or []) if s]
+    if not ids:
+        return None
+    listed = ", ".join(f"`{i}`" for i in ids)
+    return (
+        "## Fix scope (blocking checks only)\n\n"
+        f"Fix ONLY these blocking check(s): {listed}. Do NOT modify anything to "
+        "address any other finding. Any other check named in the context below - "
+        "in particular advisory findings - is for human review: leave the code "
+        "for it exactly as-is. Touching it will cause your entire patch to be "
+        "rejected."
+    )
+
+
 def build_proposal_prompt(
     fenced_context: FencedContext,
     feedback: Optional[str] = None,
     preloaded_files: Optional[str] = None,
+    blocking_scope: Optional[Sequence[str]] = None,
 ) -> str:
     """Build the full prompt for the structured-fix-proposal pass.
 
@@ -359,7 +385,11 @@ def build_proposal_prompt(
     existing callers that never pass `feedback` see no change in behavior.
     """
 
-    parts = [PROPOSAL_INSTRUCTIONS.strip(), fenced_context.render()]
+    parts = [PROPOSAL_INSTRUCTIONS.strip()]
+    scope = _render_blocking_scope(blocking_scope)
+    if scope:
+        parts.append(scope)
+    parts.append(fenced_context.render())
     if preloaded_files:
         parts.append(preloaded_files)
     if feedback:

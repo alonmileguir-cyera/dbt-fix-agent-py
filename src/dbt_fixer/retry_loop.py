@@ -199,6 +199,7 @@ def run_bounded_fix_attempt(
             pipeline_result = run_fix_pipeline(
                 repo_root, fenced_context, model_runner, budget,
                 feedback=feedback, preloaded_files=preloaded_files,
+                blocking_scope=originally_failing_ids,
             )
             if not pipeline_result.ok:
                 last_reason = pipeline_result.reason or "no proposal was produced"

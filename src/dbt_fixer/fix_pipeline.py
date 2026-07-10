@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 from .applier import ApplyError, apply_proposal
 from .bounds import ExecutionBudget
@@ -53,6 +53,7 @@ def run_fix_pipeline(
     budget: ExecutionBudget,
     feedback: Optional[str] = None,
     preloaded_files: Optional[str] = None,
+    blocking_scope: Optional[Sequence[str]] = None,
 ) -> FixPipelineResult:
     """Run one full, offline, read-propose-apply-diff pipeline pass.
 
@@ -78,7 +79,9 @@ def run_fix_pipeline(
     """
 
     repo_root = Path(repo_root)
-    prompt = build_proposal_prompt(fenced_context, feedback, preloaded_files)
+    prompt = build_proposal_prompt(
+        fenced_context, feedback, preloaded_files, blocking_scope=blocking_scope
+    )
     pass_result = run_proposal_pass(runner, prompt, budget)
 
     if not pass_result.ok:

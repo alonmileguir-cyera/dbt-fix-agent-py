@@ -266,6 +266,24 @@ def test_prompt_contains_fenced_context_verbatim_and_instructions() -> None:
     assert fenced.render() in prompt
 
 
+def test_prompt_scopes_to_blocking_checks_when_given() -> None:
+    fenced = fence_context({"failure_context": "schema mismatch + advisory noise"})
+
+    scoped = build_proposal_prompt(
+        fenced, blocking_scope=["schema_contract_verification"]
+    )
+    assert "Fix scope (blocking checks only)" in scoped
+    assert "`schema_contract_verification`" in scoped
+    assert "for human review" in scoped
+    # The fenced context is still present verbatim, and the scope sits before it.
+    assert fenced.render() in scoped
+    assert scoped.index("Fix scope") < scoped.index(fenced.render())
+
+    # No scope given -> identical to the un-scoped prompt (existing callers).
+    assert build_proposal_prompt(fenced, blocking_scope=None) == build_proposal_prompt(fenced)
+    assert build_proposal_prompt(fenced, blocking_scope=[]) == build_proposal_prompt(fenced)
+
+
 def test_prompt_never_contains_raw_unfenced_untrusted_marker_free_content() -> None:
     # An attacker-controlled failure_context that itself contains lookalike
     # fence markers must come through neutralized in the rendered fence, and
