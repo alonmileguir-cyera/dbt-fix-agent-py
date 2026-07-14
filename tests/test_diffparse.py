@@ -19,6 +19,7 @@ from dbt_fixer.diffparse import (
     PatchApplyError,
     apply_diff,
     apply_file_diff,
+    invert_diff,
     parse_diff,
 )
 from dbt_fixer.pathsafe import PathTraversalError
@@ -150,6 +151,53 @@ def test_removed_and_added_lines_are_newline_stripped() -> None:
     block = parse_diff(diff_text)[0]
     assert block.removed_lines() == ("old",)
     assert block.added_lines() == ("new",)
+
+
+@pytest.mark.parametrize(
+    ("before_text", "after_text", "diff_text"),
+    [
+        (
+            "old",
+            "new\n",
+            "diff --git a/x.sql b/x.sql\n"
+            "--- a/x.sql\n"
+            "+++ b/x.sql\n"
+            "@@ -1 +1 @@\n"
+            "-old\n"
+            "\\ No newline at end of file\n"
+            "+new\n",
+        ),
+        (
+            "old\n",
+            "new",
+            "diff --git a/x.sql b/x.sql\n"
+            "--- a/x.sql\n"
+            "+++ b/x.sql\n"
+            "@@ -1 +1 @@\n"
+            "-old\n"
+            "+new\n"
+            "\\ No newline at end of file\n",
+        ),
+    ],
+)
+def test_no_newline_marker_apply_and_invert_round_trip(
+    tmp_path: Path, before_text: str, after_text: str, diff_text: str
+) -> None:
+    block = parse_diff(diff_text)[0]
+    removed = next(line for line in block.hunks[0].lines if line.kind == "removed")
+    added = next(line for line in block.hunks[0].lines if line.kind == "added")
+    assert removed.text.endswith("\n") == before_text.endswith("\n")
+    assert added.text.endswith("\n") == after_text.endswith("\n")
+
+    target = tmp_path / "x.sql"
+    target.write_bytes(before_text.encode())
+    apply_diff(tmp_path, diff_text)
+    assert target.read_bytes() == after_text.encode()
+
+    inverse = invert_diff(diff_text)
+    assert inverse.count("\\ No newline at end of file\n") == 1
+    apply_diff(tmp_path, inverse)
+    assert target.read_bytes() == before_text.encode()
 
 
 def test_parse_diff_tolerates_real_git_metadata_lines():
