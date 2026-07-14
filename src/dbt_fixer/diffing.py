@@ -28,6 +28,7 @@ from typing import Iterable, List, Literal, Optional
 ChangeKind = Literal["added", "deleted", "modified"]
 
 _DEV_NULL = "/dev/null"
+_NO_NEWLINE_MARKER = r"\ No newline at end of file"
 
 
 @dataclass(frozen=True)
@@ -86,8 +87,19 @@ def diff_one_file(
     hunk_lines = list(
         difflib.unified_diff(before_lines, after_lines, fromfile=from_file, tofile=to_file)
     )
+    # ``difflib`` preserves a source line's missing trailing newline by
+    # returning a hunk entry without ``\n``. Joining those entries directly
+    # would concatenate the following hunk line (for example ``-old+new``),
+    # which is not a valid unified diff. Render the same explicit marker Git
+    # uses so the parser can preserve each side's EOF-newline state.
+    hunk_text = "".join(
+        line
+        if line.endswith("\n")
+        else f"{line}\n{_NO_NEWLINE_MARKER}\n"
+        for line in hunk_lines
+    )
     header = f"diff --git a/{relative_path} b/{relative_path}\n"
-    return FileDiff(path=relative_path, change_kind=change_kind, unified_diff=header + "".join(hunk_lines))
+    return FileDiff(path=relative_path, change_kind=change_kind, unified_diff=header + hunk_text)
 
 
 def generate_unified_diff(
