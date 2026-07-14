@@ -56,6 +56,7 @@ HunkLineKind = Literal["context", "added", "removed"]
 ChangeKind = Literal["added", "deleted", "modified"]
 
 _DEV_NULL = "/dev/null"
+_NO_NEWLINE_MARKER = r"\ No newline at end of file"
 
 _FILE_HEADER_RE = re.compile(r"^diff --git a/(?P<a>.+) b/(?P<b>.+)$")
 _FROM_FILE_RE = re.compile(r"^--- (?P<path>.+)$")
@@ -174,10 +175,27 @@ def _parse_hunk_body(lines: List[str], index: int, old_count: int, new_count: in
     body: List[HunkLine] = []
     old_seen = 0
     new_seen = 0
-    while old_seen < old_count or new_seen < new_count:
+    while True:
         if index >= len(lines):
+            if old_seen == old_count and new_seen == new_count:
+                break
             raise DiffParseError(f"hunk body for {path!r} ended before its declared line counts")
         raw = lines[index]
+        if raw == _NO_NEWLINE_MARKER:
+            if not body:
+                raise DiffParseError(
+                    f"no-newline marker in {path!r} does not follow a hunk body line"
+                )
+            previous = body[-1]
+            if not previous.text.endswith("\n"):
+                raise DiffParseError(
+                    f"duplicate no-newline marker for a hunk body line in {path!r}"
+                )
+            body[-1] = HunkLine(kind=previous.kind, text=previous.text[:-1])
+            index += 1
+            continue
+        if old_seen == old_count and new_seen == new_count:
+            break
         if raw.startswith("@@ ") or raw.startswith("diff --git "):
             raise DiffParseError(
                 f"hunk body for {path!r} ended before its declared line counts"
@@ -461,13 +479,15 @@ def invert_diff(diff_text: str) -> str:
                 f"@@ -{hunk.new_start},{hunk.new_count} +{hunk.old_start},{hunk.old_count} @@\n"
             )
             for line in hunk.lines:
-                text = line.text if line.text.endswith("\n") else line.text + "\n"
                 if line.kind == "added":
-                    out.append("-" + text)
+                    prefix = "-"
                 elif line.kind == "removed":
-                    out.append("+" + text)
+                    prefix = "+"
                 else:
-                    out.append(" " + text)
+                    prefix = " "
+                out.append(prefix + line.text)
+                if not line.text.endswith("\n"):
+                    out.append(f"\n{_NO_NEWLINE_MARKER}\n")
     return "".join(out)
 
 

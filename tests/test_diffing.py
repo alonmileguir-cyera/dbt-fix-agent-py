@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from dbt_fixer.diffing import diff_one_file, generate_unified_diff
 
 
@@ -50,6 +52,23 @@ def test_diff_one_file_deleted_uses_dev_null_to_side() -> None:
 
 def test_diff_one_file_returns_none_when_both_sides_absent() -> None:
     assert diff_one_file(None, None, "models/never_existed.sql") is None
+
+
+@pytest.mark.parametrize(
+    ("before_text", "after_text"),
+    [
+        ("select 1", "select 2\n"),
+        ("select 1\n", "select 2"),
+    ],
+)
+def test_diff_one_file_preserves_eof_newline_transitions(
+    before_text: str, after_text: str
+) -> None:
+    result = diff_one_file(before_text, after_text, "models/a.sql")
+
+    assert result is not None
+    assert result.unified_diff.count("\\ No newline at end of file\n") == 1
+    assert "-select 1+select 2" not in result.unified_diff
 
 
 def _make_tree(root: Path, files: dict[str, str]) -> None:
