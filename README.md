@@ -43,7 +43,9 @@ production seams (`dbt_fixer.runners`: a Bedrock-backed model runner for
 the proposal pass, a fresh tool-free finalizer for empty/malformed proposal
 output, an independently-constructed runner for the fix-refuter pass, and
 real subprocess runners for the sealed-auditor re-audit and `dbt parse`
-gates). Whatever that attempt resolves to — `proposed`,
+gates). The dbt parse gate is disabled by default and can run only after an
+explicit trusted `DBT_FIXER_DBT_PARSE_MODE=enabled` opt-in. Whatever that
+attempt resolves to — `proposed`,
 `no_safe_fix`, or `failed` — is reported, unconditionally, to Slack
 (`dbt_fixer.slack_delivery.deliver_shadow_report`, which never raises and
 never influences the already-computed result) and then to stdout.
@@ -113,6 +115,7 @@ pytest -m real_process tests/real_process
 | `DBT_FIXER_MAX_CHANGED_LINES` | no | `60` | Non-numeric, or outside `[1, 2000]` → falls back to `60` and records a warning. Enforced by the Sprint 3 allowlist gate. |
 | `DBT_FIXER_REAUDIT_TIMEOUT_SECONDS` | no | `120` | Non-numeric, or outside `[1, 1800]` → falls back to `120` and records a warning. Bounds the Sprint 3 re-audit gate's subprocess call. |
 | `DBT_FIXER_REFUTER_TIMEOUT_SECONDS` | no | `60` | Non-numeric, or outside `[1, 600]` → falls back to `60` and records a warning. Bounds the Sprint 4 fix-refuter gate's model call; a timeout resolves to a fail-closed "refuted" verdict, never a skipped gate. |
+| `DBT_FIXER_DBT_PARSE_MODE` | no | `disabled` | Only explicit `enabled` opts in. Unset/blank stays disabled; any other value fails safe to `disabled` and records a warning. The live `pull_request_target` workflow sets `disabled`. |
 | `DBT_FIXER_DBT_PARSE_TIMEOUT_SECONDS` | no | `30` | Non-numeric, or outside `[1, 300]` → falls back to `30` and records a warning. Bounds any `dbt parse`-style structural-validation subprocess call. |
 
 ### Bounded-execution primitive (`dbt_fixer.bounds`)

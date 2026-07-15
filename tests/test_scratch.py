@@ -100,3 +100,30 @@ def test_two_scratch_copies_of_the_same_source_are_independent(tmp_path):
         assert dest_a != dest_b
         (dest_a / "model.sql").write_text("select 'a'")
         assert (dest_b / "model.sql").read_text() == "select 1"
+
+
+def test_rejects_file_symlink_before_copy(tmp_path):
+    outside = tmp_path / "outside-secret.txt"
+    outside.write_text("must-not-be-copied")
+    src = _make_repo(tmp_path)
+    (src / "linked-secret.txt").symlink_to(outside)
+
+    with pytest.raises(ScratchCopyError, match=r"unsupported symlink: linked-secret\.txt"):
+        with scratch_copy(src):
+            pass  # pragma: no cover - must never get here
+
+    assert outside.read_text() == "must-not-be-copied"
+
+
+def test_rejects_directory_symlink_before_copy(tmp_path):
+    outside = tmp_path / "outside-directory"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("must-not-be-copied")
+    src = _make_repo(tmp_path)
+    (src / "linked-directory").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ScratchCopyError, match=r"unsupported symlink: linked-directory"):
+        with scratch_copy(src):
+            pass  # pragma: no cover - must never get here
+
+    assert (outside / "secret.txt").read_text() == "must-not-be-copied"

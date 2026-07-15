@@ -20,6 +20,7 @@ Nothing in this module ever mutates `source`.
 
 from __future__ import annotations
 
+import os
 import shutil
 import tempfile
 from contextlib import contextmanager
@@ -31,19 +32,35 @@ class ScratchCopyError(RuntimeError):
     """Raised when a scratch copy cannot be created (e.g. bad source path)."""
 
 
+def _reject_symlinks(source: Path) -> None:
+    """Reject repository symlinks before copying any PR-controlled content."""
+
+    for root, directories, files in os.walk(source, followlinks=False):
+        root_path = Path(root)
+        directories[:] = [name for name in directories if name != ".git"]
+        for name in (*directories, *files):
+            candidate = root_path / name
+            if candidate.is_symlink():
+                relative = candidate.relative_to(source)
+                raise ScratchCopyError(
+                    f"scratch source contains unsupported symlink: {relative}"
+                )
+
+
 @contextmanager
 def scratch_copy(source: Path, *, prefix: str = "dbt-fixer-scratch-") -> Iterator[Path]:
     """Yield an isolated, writable copy of `source` in a fresh temp directory.
 
     Raises `ScratchCopyError` immediately (before creating anything) if
-    `source` does not exist or is not a directory. Otherwise always cleans
-    up the entire temp root on exit, regardless of how the `with` block
-    exits.
+    `source` does not exist, is not a directory, or contains a symlink outside
+    `.git`. Otherwise always cleans up the entire temp root on exit, regardless
+    of how the `with` block exits.
     """
 
     source = Path(source)
     if not source.exists() or not source.is_dir():
         raise ScratchCopyError(f"scratch source {source} does not exist or is not a directory")
+    _reject_symlinks(source)
 
     tmp_root = Path(tempfile.mkdtemp(prefix=prefix))
     try:
@@ -51,9 +68,14 @@ def scratch_copy(source: Path, *, prefix: str = "dbt-fixer-scratch-") -> Iterato
         shutil.copytree(
             source,
             dest,
-            symlinks=False,
+            # Preserve any symlink introduced in the narrow interval after the
+            # validation walk instead of ever dereferencing it.
+            symlinks=True,
             ignore=shutil.ignore_patterns(".git"),
         )
+        # Close the validation/copy race: a link introduced after the source
+        # walk is preserved above, then rejected here before the copy is used.
+        _reject_symlinks(dest)
         yield dest
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)

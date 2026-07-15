@@ -107,7 +107,9 @@ def test_invokes_auditor_in_shadow_mode_with_no_slack_channel_against_patched_sc
     assert len(runner.calls) == 1
     call = runner.calls[0]
     assert call["args"][0] == "/usr/bin/python3.11"
+    assert call["args"][1:3] == ["-P", "-m"]
     assert ENTRYPOINT_MODULE in call["args"]
+    assert call["env"]["PYTHONSAFEPATH"] == "1"
     assert call["env"]["DBT_AUDITOR_SHADOW_MODE"] == "true"
     assert "DBT_AUDITOR_SLACK_CHANNEL" not in call["env"]
     assert call["timeout"] == 30.0
@@ -348,6 +350,7 @@ def test_auditor_env_passes_credentials_knobs_and_report_path(monkeypatch):
     assert env["DBT_AUDITOR_TIMEOUT_SECONDS"] == "900"
     assert env["DBT_AUDITOR_MAX_TOOL_CALLS"] == "50"
     assert env["DBT_AUDITOR_REPORT_PATH"] == "/tmp/r.md"
+    assert env["PYTHONSAFEPATH"] == "1"
     assert "DBT_AUDITOR_SLACK_CHANNEL" not in env
 
 

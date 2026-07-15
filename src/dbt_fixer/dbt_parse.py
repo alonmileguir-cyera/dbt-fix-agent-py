@@ -2,9 +2,10 @@
 
 Unlike every other gate in this package, this one is allowed to not run at
 all -- and when it doesn't, that is recorded honestly as `"skipped"`,
-never conflated with `"passed"` or `"failed"`. It exists purely as a fast,
-opportunistic extra signal: if a real `dbt` executable happens to be on
-`PATH`, run `dbt parse` against the touched project directory (inside a
+never conflated with `"passed"` or `"failed"`. It is disabled by default
+and exists purely as an explicitly opted-in extra signal: only when trusted
+configuration enables it may a real `dbt` executable on `PATH` run
+`dbt parse` against the touched project directory (inside a
 scratch copy with the candidate diff applied) under a bounded timeout, and
 kill the candidate on a nonzero exit or a timeout. If `dbt` is not
 available, or the scratch copy/candidate-apply step itself cannot be
@@ -223,6 +224,7 @@ def run_dbt_parse_gate(
     timeout_seconds: float,
     subprocess_runner: DbtSubprocessRunner,
     which: WhichFunc = shutil.which,
+    enabled: bool = False,
 ) -> DbtParseVerdict:
     """Run the best-effort dbt Parse Gate for one candidate diff.
 
@@ -238,6 +240,9 @@ def run_dbt_parse_gate(
         which: Injectable PATH-lookup callable, defaulting to
             `shutil.which`. Returning `None` (no `dbt` on PATH) resolves
             to `"skipped"` before any scratch copy is even created.
+        enabled: Explicit trusted opt-in. Defaults to `False`; when false,
+            the gate returns `"skipped"` before PATH lookup, scratch copy,
+            or subprocess invocation.
 
     Returns:
         A `DbtParseVerdict`. Never raises: every failure mode (no `dbt` on
@@ -246,6 +251,15 @@ def run_dbt_parse_gate(
         resolves to a `DbtParseVerdict` field, never an exception escaping
         this function.
     """
+
+    if not enabled:
+        return DbtParseVerdict(
+            outcome="skipped",
+            reason=(
+                "dbt parse is disabled by trusted configuration; no PATH lookup "
+                "or subprocess invocation was attempted"
+            ),
+        )
 
     dbt_path = which("dbt")
     if not dbt_path:

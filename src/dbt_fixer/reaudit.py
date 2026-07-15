@@ -166,6 +166,11 @@ def build_auditor_env(
             env[key] = os.environ[key]
     env.update(
         {
+            # The re-audit runs with its cwd set to a scratch copy of the PR.
+            # Keep that untrusted directory out of Python's import search so a
+            # PR-supplied ``dbt_auditor`` package cannot shadow the sealed
+            # installed sibling and execute with the re-audit's AWS identity.
+            "PYTHONSAFEPATH": "1",
             "DBT_AUDITOR_REPO_PATH": str(repo_path),
             "DBT_AUDITOR_PR_DIFF": pr_diff,
             "DBT_AUDITOR_PR_TITLE": pr_title,
@@ -254,7 +259,10 @@ def combine_diffs(pr_diff: str, candidate_diff: str) -> str:
 def build_auditor_args(auditor_python: str) -> list:
     """Build the subprocess argv for invoking the sealed auditor as a module."""
 
-    return [auditor_python, "-m", ENTRYPOINT_MODULE]
+    # ``-P`` is the interpreter-level guarantee that the untrusted scratch cwd
+    # is not prepended to sys.path. PYTHONSAFEPATH in build_auditor_env is the
+    # matching environment-level defense in depth.
+    return [auditor_python, "-P", "-m", ENTRYPOINT_MODULE]
 
 
 @dataclass(frozen=True)

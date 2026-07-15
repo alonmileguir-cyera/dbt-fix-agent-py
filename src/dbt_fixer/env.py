@@ -29,6 +29,7 @@ Environment-contract table (this module's slice of it):
 | `DBT_FIXER_MAX_CHANGED_LINES`  | no       | `60`                | non-numeric/out-of-`[1, 2000]` -> falls back to `60`, records a warning |
 | `DBT_FIXER_REAUDIT_TIMEOUT_SECONDS` | no  | `900`               | non-numeric/out-of-`[1, 1800]` -> falls back to `900`, records a warning |
 | `DBT_FIXER_REFUTER_TIMEOUT_SECONDS` | no  | `600`               | non-numeric/out-of-`[1, 1200]` -> falls back to `600`, records a warning |
+| `DBT_FIXER_DBT_PARSE_MODE`     | no       | `disabled`          | only explicit `enabled` opts in; anything else fails safe to `disabled` with a warning |
 | `DBT_FIXER_DBT_PARSE_TIMEOUT_SECONDS` | no | `30`               | non-numeric/out-of-`[1, 300]` -> falls back to `30`, records a warning |
 
 `FixerConfig.warnings` carries every fallback-to-default explanation so a
@@ -47,6 +48,7 @@ from ._numeric import parse_bounded_number
 
 FailureKind = Literal["ci", "audit"]
 _VALID_FAILURE_KINDS: tuple[str, ...] = ("ci", "audit")
+DbtParseMode = Literal["disabled", "enabled"]
 
 # One proposal through the full gate stack by default. Each retry round
 # re-runs the expensive gates (a full re-audit + refuter), which in the
@@ -77,6 +79,7 @@ _REFUTER_TIMEOUT_SECONDS_RANGE = (1, 1200)
 
 DEFAULT_DBT_PARSE_TIMEOUT_SECONDS = 30
 _DBT_PARSE_TIMEOUT_SECONDS_RANGE = (1, 300)
+DEFAULT_DBT_PARSE_MODE: DbtParseMode = "disabled"
 
 ENV_FAILURE_KIND = "DBT_FIXER_FAILURE_KIND"
 ENV_REPO_PATH = "DBT_FIXER_REPO_PATH"
@@ -92,6 +95,7 @@ ENV_MAX_CHANGED_FILES = "DBT_FIXER_MAX_CHANGED_FILES"
 ENV_MAX_CHANGED_LINES = "DBT_FIXER_MAX_CHANGED_LINES"
 ENV_REAUDIT_TIMEOUT_SECONDS = "DBT_FIXER_REAUDIT_TIMEOUT_SECONDS"
 ENV_REFUTER_TIMEOUT_SECONDS = "DBT_FIXER_REFUTER_TIMEOUT_SECONDS"
+ENV_DBT_PARSE_MODE = "DBT_FIXER_DBT_PARSE_MODE"
 ENV_DBT_PARSE_TIMEOUT_SECONDS = "DBT_FIXER_DBT_PARSE_TIMEOUT_SECONDS"
 
 
@@ -122,6 +126,7 @@ class FixerConfig:
     max_changed_lines: int = DEFAULT_MAX_CHANGED_LINES
     reaudit_timeout_seconds: float = DEFAULT_REAUDIT_TIMEOUT_SECONDS
     refuter_timeout_seconds: float = DEFAULT_REFUTER_TIMEOUT_SECONDS
+    dbt_parse_mode: DbtParseMode = DEFAULT_DBT_PARSE_MODE
     dbt_parse_timeout_seconds: float = DEFAULT_DBT_PARSE_TIMEOUT_SECONDS
 
     warnings: tuple[str, ...] = field(default_factory=tuple)
@@ -206,6 +211,24 @@ def _parse_dbt_parse_timeout_seconds(env: Mapping[str, str], warnings: list[str]
     )
 
 
+def _parse_dbt_parse_mode(env: Mapping[str, str], warnings: list[str]) -> DbtParseMode:
+    """Require an explicit ``enabled`` value; every other value fails safe."""
+
+    raw = env.get(ENV_DBT_PARSE_MODE)
+    if raw is None or not raw.strip():
+        return DEFAULT_DBT_PARSE_MODE
+    normalized = raw.strip().lower()
+    if normalized == "enabled":
+        return "enabled"
+    if normalized == "disabled":
+        return "disabled"
+    warnings.append(
+        f"{ENV_DBT_PARSE_MODE}={raw!r} is invalid; using fail-safe default "
+        f"{DEFAULT_DBT_PARSE_MODE!r}"
+    )
+    return DEFAULT_DBT_PARSE_MODE
+
+
 def load_config(env: Optional[Mapping[str, str]] = None) -> FixerConfig:
     """Parse and validate the `DBT_FIXER_*` environment contract.
 
@@ -237,6 +260,7 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> FixerConfig:
     max_changed_lines = _parse_max_changed_lines(env, warnings)
     reaudit_timeout_seconds = _parse_reaudit_timeout_seconds(env, warnings)
     refuter_timeout_seconds = _parse_refuter_timeout_seconds(env, warnings)
+    dbt_parse_mode = _parse_dbt_parse_mode(env, warnings)
     dbt_parse_timeout_seconds = _parse_dbt_parse_timeout_seconds(env, warnings)
 
     slack_channel = env.get(ENV_SLACK_CHANNEL) or None
@@ -257,6 +281,7 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> FixerConfig:
         max_changed_lines=max_changed_lines,
         reaudit_timeout_seconds=reaudit_timeout_seconds,
         refuter_timeout_seconds=refuter_timeout_seconds,
+        dbt_parse_mode=dbt_parse_mode,
         dbt_parse_timeout_seconds=dbt_parse_timeout_seconds,
         warnings=tuple(warnings),
     )
