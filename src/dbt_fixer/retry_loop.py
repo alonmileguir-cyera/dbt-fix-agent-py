@@ -320,6 +320,7 @@ def run_bounded_fix_attempt(
                 timeout_seconds=config.dbt_parse_timeout_seconds,
                 subprocess_runner=dbt_subprocess_runner,
                 which=which,
+                enabled=config.dbt_parse_mode == "enabled",
             )
 
             if dbt_parse_verdict.outcome == "failed":

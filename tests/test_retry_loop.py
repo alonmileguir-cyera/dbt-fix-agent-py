@@ -196,7 +196,7 @@ def test_tool_free_finalizer_candidate_traverses_the_complete_gate_chain(
     )
 
     result = _call(
-        config=_config(repo, max_rounds=1),
+        config=_config(repo, max_rounds=1, dbt_parse_mode="enabled"),
         target=_target(),
         fenced_context=_fenced_context(),
         repo_root=repo,
@@ -479,7 +479,7 @@ def test_fix_refuter_passing_lets_the_round_reach_the_dbt_parse_gate(tmp_path: P
         return ProcessOutcome(returncode=0, stdout="", stderr="")
 
     result = _call(
-        config=_config(repo),
+        config=_config(repo, dbt_parse_mode="enabled"),
         target=_target(),
         fenced_context=_fenced_context(),
         repo_root=repo,
@@ -499,6 +499,39 @@ def test_fix_refuter_passing_lets_the_round_reach_the_dbt_parse_gate(tmp_path: P
         "fix-refuter": "pass",
         "dbt parse": "pass",
     }
+
+
+def test_disabled_dbt_parse_never_probes_or_invokes_an_ambient_binary(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    model_runner = _RecordingModelRunner(
+        lambda n: _whole_file_proposal("models/a.sql", "select 1\nfrom x\nwhere y = 1\n")
+    )
+    subprocess_runner = _RecordingSubprocessRunner(
+        lambda n: ProcessOutcome(returncode=0, stdout=_PASSED_STDOUT)
+    )
+
+    def should_not_probe_path(name: str):
+        raise AssertionError(f"ambient PATH lookup attempted for {name}")
+
+    def should_not_invoke_dbt(argv, cwd, timeout_seconds):
+        raise AssertionError(f"ambient dbt invocation attempted: {argv}")
+
+    result = _call(
+        config=_config(repo),
+        target=_target(),
+        fenced_context=_fenced_context(),
+        repo_root=repo,
+        model_runner=model_runner,
+        subprocess_runner=subprocess_runner,
+        dbt_subprocess_runner=should_not_invoke_dbt,
+        which=should_not_probe_path,
+        budget=_budget(),
+    )
+
+    assert result.run_result.status == "proposed"
+    gates = {gate.name: gate for gate in result.run_result.gates}
+    assert gates["dbt parse"].outcome == "skipped"
+    assert "disabled" in gates["dbt parse"].detail
 
 
 def test_refuter_runner_is_a_distinct_isolated_context_from_the_proposal_pass(
@@ -598,7 +631,7 @@ def test_dbt_parse_gate_failure_rejects_the_round_but_stays_non_authoritative_on
         return ProcessOutcome(returncode=0, stdout="", stderr="")  # baseline
 
     result = _call(
-        config=_config(repo, max_rounds=2),
+        config=_config(repo, max_rounds=2, dbt_parse_mode="enabled"),
         target=_target(),
         fenced_context=_fenced_context(),
         repo_root=repo,

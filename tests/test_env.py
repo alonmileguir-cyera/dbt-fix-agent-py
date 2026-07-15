@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from dbt_fixer.env import (
+    DEFAULT_DBT_PARSE_MODE,
     DEFAULT_DBT_PARSE_TIMEOUT_SECONDS,
     DEFAULT_MAX_CHANGED_FILES,
     DEFAULT_MAX_CHANGED_LINES,
@@ -12,6 +13,7 @@ from dbt_fixer.env import (
     DEFAULT_REAUDIT_TIMEOUT_SECONDS,
     DEFAULT_REFUTER_TIMEOUT_SECONDS,
     ENV_AUDITOR_PYTHON,
+    ENV_DBT_PARSE_MODE,
     ENV_DBT_PARSE_TIMEOUT_SECONDS,
     ENV_FAILURE_KIND,
     ENV_MAX_CHANGED_FILES,
@@ -90,6 +92,7 @@ def test_all_optional_fields_default_when_unset(tmp_path):
     assert config.max_changed_lines == DEFAULT_MAX_CHANGED_LINES
     assert config.reaudit_timeout_seconds == DEFAULT_REAUDIT_TIMEOUT_SECONDS
     assert config.refuter_timeout_seconds == DEFAULT_REFUTER_TIMEOUT_SECONDS
+    assert config.dbt_parse_mode == DEFAULT_DBT_PARSE_MODE
     assert config.dbt_parse_timeout_seconds == DEFAULT_DBT_PARSE_TIMEOUT_SECONDS
     assert config.warnings == ()
 
@@ -109,6 +112,7 @@ def test_optional_fields_are_respected_when_set(tmp_path):
             ENV_MAX_CHANGED_LINES: "200",
             ENV_REAUDIT_TIMEOUT_SECONDS: "30",
             ENV_REFUTER_TIMEOUT_SECONDS: "45",
+            ENV_DBT_PARSE_MODE: "enabled",
             ENV_DBT_PARSE_TIMEOUT_SECONDS: "15",
         },
     )
@@ -124,7 +128,22 @@ def test_optional_fields_are_respected_when_set(tmp_path):
     assert config.max_changed_lines == 200
     assert config.reaudit_timeout_seconds == 30
     assert config.refuter_timeout_seconds == 45
+    assert config.dbt_parse_mode == "enabled"
     assert config.dbt_parse_timeout_seconds == 15
+
+
+@pytest.mark.parametrize("value", ["enabled", "ENABLED", " enabled "])
+def test_dbt_parse_requires_explicit_recognized_opt_in(tmp_path, value):
+    config = load_config(_base_env(tmp_path, **{ENV_DBT_PARSE_MODE: value}))
+    assert config.dbt_parse_mode == "enabled"
+    assert config.warnings == ()
+
+
+@pytest.mark.parametrize("value", ["true", "on", "1", "unexpected"])
+def test_unrecognized_dbt_parse_mode_fails_safe_to_disabled(tmp_path, value):
+    config = load_config(_base_env(tmp_path, **{ENV_DBT_PARSE_MODE: value}))
+    assert config.dbt_parse_mode == "disabled"
+    assert any(ENV_DBT_PARSE_MODE in warning for warning in config.warnings)
 
 
 @pytest.mark.parametrize("bad_value", ["not-a-number", "-1", "0", "999", "3.5"])

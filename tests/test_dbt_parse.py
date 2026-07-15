@@ -13,8 +13,6 @@ import time
 from pathlib import Path
 from typing import List
 
-import pytest
-
 from dbt_fixer.dbt_parse import (
     DbtInvocationError,
     DbtParseTimeoutError,
@@ -69,6 +67,29 @@ def _fake_which(path: str | None = "/usr/local/bin/dbt"):
     return lambda name: path if name == "dbt" else None
 
 
+def test_gate_is_disabled_by_default_before_ambient_lookup_or_invocation(tmp_path):
+    repo = _make_repo(tmp_path)
+    lookups = []
+    runner = _RecordingDbtRunner(ProcessOutcome(returncode=0, stdout="", stderr=""))
+
+    def ambient_which(name):
+        lookups.append(name)
+        return "/usr/local/bin/dbt"
+
+    verdict = run_dbt_parse_gate(
+        repo_root=repo,
+        candidate_diff="untrusted candidate content is never inspected",
+        timeout_seconds=10.0,
+        subprocess_runner=runner,
+        which=ambient_which,
+    )
+
+    assert verdict.outcome == "skipped"
+    assert "disabled" in verdict.reason
+    assert lookups == []
+    assert runner.calls == []
+
+
 # ---------------------------------------------------------------------------
 # dbt_parse_gate_runs_when_available
 # ---------------------------------------------------------------------------
@@ -80,6 +101,7 @@ def test_gate_runs_dbt_parse_against_touched_project_dir_and_passes(tmp_path):
     runner = _RecordingDbtRunner(ProcessOutcome(returncode=0, stdout="", stderr=""))
 
     verdict = run_dbt_parse_gate(
+        enabled=True,
         repo_root=repo,
         candidate_diff=diff,
         timeout_seconds=10.0,
@@ -118,6 +140,7 @@ def test_gate_kills_candidate_on_nonzero_exit_when_baseline_is_clean(tmp_path):
         return outcomes[len(calls) - 1]
 
     verdict = run_dbt_parse_gate(
+        enabled=True,
         repo_root=repo,
         candidate_diff=diff,
         timeout_seconds=10.0,
@@ -143,6 +166,7 @@ def test_gate_skips_when_baseline_also_fails_to_parse(tmp_path):
     )
 
     verdict = run_dbt_parse_gate(
+        enabled=True,
         repo_root=repo,
         candidate_diff=diff,
         timeout_seconds=10.0,
@@ -161,6 +185,7 @@ def test_gate_kills_candidate_on_timeout(tmp_path):
     runner = _RecordingDbtRunner(error=DbtParseTimeoutError("exceeded 5s"))
 
     verdict = run_dbt_parse_gate(
+        enabled=True,
         repo_root=repo,
         candidate_diff=diff,
         timeout_seconds=5.0,
@@ -188,6 +213,7 @@ def test_gate_kills_candidate_when_runner_blocks_past_timeout(tmp_path):
 
     start = time.monotonic()
     verdict = run_dbt_parse_gate(
+        enabled=True,
         repo_root=repo,
         candidate_diff=diff,
         timeout_seconds=0.05,
@@ -217,6 +243,7 @@ def test_gate_kills_candidate_when_runner_hangs_forever_without_hanging_the_test
 
     start = time.monotonic()
     verdict = run_dbt_parse_gate(
+        enabled=True,
         repo_root=repo,
         candidate_diff=diff,
         timeout_seconds=0.05,
@@ -243,6 +270,7 @@ def test_gate_finds_nested_project_dir(tmp_path):
 
     runner = _RecordingDbtRunner(ProcessOutcome(returncode=0, stdout="", stderr=""))
     verdict = run_dbt_parse_gate(
+        enabled=True,
         repo_root=repo,
         candidate_diff=diff,
         timeout_seconds=10.0,
@@ -265,6 +293,7 @@ def test_gate_skips_when_dbt_not_on_path(tmp_path):
     runner = _RecordingDbtRunner(ProcessOutcome(returncode=0, stdout="", stderr=""))
 
     verdict = run_dbt_parse_gate(
+        enabled=True,
         repo_root=repo,
         candidate_diff=diff,
         timeout_seconds=10.0,
@@ -284,6 +313,7 @@ def test_gate_skips_when_invocation_fails(tmp_path):
     runner = _RecordingDbtRunner(error=DbtInvocationError("dbt disappeared"))
 
     verdict = run_dbt_parse_gate(
+        enabled=True,
         repo_root=repo,
         candidate_diff=diff,
         timeout_seconds=10.0,
@@ -311,6 +341,7 @@ def test_gate_skips_on_scratch_copy_failure(tmp_path, monkeypatch):
     monkeypatch.setattr("dbt_fixer.dbt_parse.scratch_copy", _boom)
 
     verdict = run_dbt_parse_gate(
+        enabled=True,
         repo_root=repo,
         candidate_diff=diff,
         timeout_seconds=10.0,
@@ -337,6 +368,7 @@ def test_gate_skips_when_no_project_dir_found(tmp_path):
 
     runner = _RecordingDbtRunner(ProcessOutcome(returncode=0, stdout="", stderr=""))
     verdict = run_dbt_parse_gate(
+        enabled=True,
         repo_root=repo,
         candidate_diff=diff,
         timeout_seconds=10.0,
@@ -361,6 +393,7 @@ def test_gate_skips_when_candidate_diff_does_not_apply(tmp_path):
     runner = _RecordingDbtRunner(ProcessOutcome(returncode=0, stdout="", stderr=""))
 
     verdict = run_dbt_parse_gate(
+        enabled=True,
         repo_root=repo,
         candidate_diff=bad_diff,
         timeout_seconds=10.0,
