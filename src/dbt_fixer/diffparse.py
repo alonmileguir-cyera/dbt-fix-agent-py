@@ -13,8 +13,8 @@ Two independent consumers drive this module's shape:
 
 - The allowlist gate (`dbt_fixer.allowlist`) needs to inspect a diff's
   added/removed lines per file (e.g. to check whether a SQL deletion in a
-  candidate diff merely restores a line the *original PR diff* itself
-  deleted) without mutating anything on disk.
+  candidate diff removes only a line the *original PR diff* itself added)
+  without mutating anything on disk.
 - The retry loop needs to materialize a candidate diff onto a fresh
   scratch copy of the repo (so the re-audit gate's sibling `dbt_auditor`
   subprocess can be pointed at a real, patched checkout) -- this is a
