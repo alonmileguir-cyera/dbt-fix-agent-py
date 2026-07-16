@@ -29,11 +29,11 @@ reported -- this function never accumulates or ranks multiple violations):
    line -- added or removed, in any touched file -- matching a sensitive
    pattern (a dbt hook, a `materialized` config change, or a masking/bypass
    keyword) is rejected outright, even if every cap is satisfied.
-4. **Restore-only SQL deletion.** Every line a `.sql` file's diff *removes*
-   must exactly match a line the *original PR diff* itself removed from
-   that same path -- i.e. the candidate may only restore what the PR took
-   away, never delete anything new. This rule applies identically for
-   `kind="ci"` and `kind="audit"`.
+4. **PR-authored-only SQL deletion.** Every line a `.sql` candidate diff
+   *removes* must consume one matching line that the original PR diff added
+   at that same path. This lets a proposal correct or revert SQL introduced
+   by the PR while preventing it from deleting pre-existing base SQL. The
+   rule applies identically for `kind="ci"` and `kind="audit"`.
 5. **Test weakening, by failure kind.** A removed dbt schema-test entry (a
    `tests:` list item, a bare `tests:` header, or a loosened `severity:
    error` line) in a `.yml`/`.yaml` file is:
@@ -201,22 +201,26 @@ def _check_hard_caps(
 
 
 def _check_restore_only_sql_deletions(
-    blocks: Tuple[FileDiffBlock, ...], pr_removed_lines_by_path: dict[str, Tuple[str, ...]]
+    blocks: Tuple[FileDiffBlock, ...], pr_added_lines_by_path: dict[str, Tuple[str, ...]]
 ) -> Optional[AllowlistVerdict]:
     for block in blocks:
         if not block.path.lower().endswith(".sql"):
             continue
-        allowed_removals = set(pr_removed_lines_by_path.get(block.path, ()))
+        # Preserve multiplicity: one line added by the PR authorizes at most
+        # one candidate removal, even when identical SQL appears repeatedly.
+        allowed_removals = Counter(pr_added_lines_by_path.get(block.path, ()))
         for removed_line in block.removed_lines():
-            if removed_line not in allowed_removals:
+            if allowed_removals[removed_line] <= 0:
                 return AllowlistVerdict(
                     passed=False,
                     violation="sql_deletion_not_a_restore",
                     reason=(
-                        f"{block.path!r} deletes a line the original PR diff did not delete "
-                        f"(not a restore): {removed_line!r}"
+                        f"{block.path!r} deletes a line the original PR diff did not add "
+                        "(not a correction/revert of PR-authored SQL): "
+                        f"{removed_line!r}"
                     ),
                 )
+            allowed_removals[removed_line] -= 1
     return None
 
 
@@ -415,12 +419,12 @@ def run_allowlist_gate(
     try:
         pr_blocks = parse_diff(pr_diff) if pr_diff.strip() else ()
     except DiffParseError:
-        # A malformed PR diff can never justify a restore; fail closed by
-        # treating it as if the PR diff removed nothing at all.
+        # A malformed PR diff can never authorize a candidate deletion; fail
+        # closed by treating it as if the PR diff added nothing at all.
         pr_blocks = ()
-    pr_removed_lines_by_path = {block.path: block.removed_lines() for block in pr_blocks}
+    pr_added_lines_by_path = {block.path: block.added_lines() for block in pr_blocks}
 
-    restore_violation = _check_restore_only_sql_deletions(blocks, pr_removed_lines_by_path)
+    restore_violation = _check_restore_only_sql_deletions(blocks, pr_added_lines_by_path)
     if restore_violation is not None:
         return restore_violation
 

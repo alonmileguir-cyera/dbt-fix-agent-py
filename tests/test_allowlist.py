@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import shutil
 from pathlib import Path
-from typing import Tuple
 
 import pytest
 
@@ -50,14 +49,13 @@ def _candidate_diff(repo: Path, tmp_path: Path, edits: dict[str, str], *, change
 
 
 def test_candidate_touching_only_allowed_files_passes_type_check(tmp_path: Path) -> None:
-    repo = _make_repo(tmp_path, {"models/a.sql": "select 1\nfrom x\nwhere y = 1\n"})
+    repo = _make_repo(tmp_path, {"models/a.sql": "select 1\n"})
     diff_text = _candidate_diff(repo, tmp_path, {"models/a.sql": "select 1\nfrom x\n"})
-    pr_diff = diff_text  # the PR itself deleted this exact line, so it's a restore-consistent case
 
     verdict = run_allowlist_gate(
         repo_root=repo,
         candidate_diff=diff_text,
-        pr_diff=pr_diff,
+        pr_diff="",
         failure_kind="ci",
         caps=DEFAULT_CAPS,
     )
@@ -81,21 +79,101 @@ def test_candidate_touching_disallowed_file_is_rejected(tmp_path: Path, path: st
     assert path in verdict.reason
 
 
-# --- restore-only SQL deletion ----------------------------------------------
+# --- PR-authored-only SQL deletion ------------------------------------------
 
 
-def test_sql_deletion_matching_pr_deletion_is_accepted(tmp_path: Path) -> None:
-    repo = _make_repo(tmp_path, {"models/a.sql": "select 1\nfrom x\nwhere y = 1\n"})
-    # The PR diff itself deleted "where y = 1" from this file.
-    pr_diff = _candidate_diff(repo, tmp_path, {"models/a.sql": "select 1\nfrom x\n"})
-    # The candidate deletes that exact same line -- a restore under this
-    # gate's literal rule.
-    candidate_diff = pr_diff
+@pytest.mark.parametrize("kind", ["ci", "audit"])
+def test_sql_replacement_can_restore_pr_added_head_line_to_exact_base_line(
+    tmp_path: Path, kind: str
+) -> None:
+    path = "models/int_product__identities.sql"
+    base_line = "{{ ref('stg_prod_aurora_etl__identity_extra')}} iex"
+    head_line = "{{ ref('stg_prod_aurora_etl__identity_extra')}} iex_dbt_audit_exact_file_canary"
+    base = _make_repo(tmp_path, {path: f"select iex.id\nfrom source\njoin {base_line}\n"})
+    head = tmp_path / "pr-head"
+    shutil.copytree(base, head)
+    head.joinpath(path).write_text(f"select iex.id\nfrom source\njoin {head_line}\n")
+    pr_diff = generate_unified_diff(base, head, [path])
+    candidate_diff = _candidate_diff(
+        head,
+        tmp_path,
+        {path: f"select iex.id\nfrom source\njoin {base_line}\n"},
+    )
 
     verdict = run_allowlist_gate(
-        repo_root=repo, candidate_diff=candidate_diff, pr_diff=pr_diff, failure_kind="ci", caps=DEFAULT_CAPS
+        repo_root=head,
+        candidate_diff=candidate_diff,
+        pr_diff=pr_diff,
+        failure_kind=kind,
+        caps=DEFAULT_CAPS,
     )
     assert verdict.passed
+
+
+def test_sql_replacement_can_correct_pr_added_head_line_to_third_safe_line(
+    tmp_path: Path,
+) -> None:
+    path = "models/a.sql"
+    base = _make_repo(tmp_path, {path: "select old_name\n"})
+    head = tmp_path / "pr-head"
+    shutil.copytree(base, head)
+    head.joinpath(path).write_text("select broken_name\n")
+    pr_diff = generate_unified_diff(base, head, [path])
+    candidate_diff = _candidate_diff(
+        head, tmp_path, {path: "select corrected_name\n"}
+    )
+
+    verdict = run_allowlist_gate(
+        repo_root=head,
+        candidate_diff=candidate_diff,
+        pr_diff=pr_diff,
+        failure_kind="audit",
+        caps=DEFAULT_CAPS,
+    )
+    assert verdict.passed
+
+
+def test_sql_candidate_cannot_remove_preexisting_base_line(tmp_path: Path) -> None:
+    path = "models/a.sql"
+    base = _make_repo(tmp_path, {path: "select 1\nfrom source\n"})
+    head = tmp_path / "pr-head"
+    shutil.copytree(base, head)
+    head.joinpath(path).write_text("select 1\nfrom source\nwhere active\n")
+    pr_diff = generate_unified_diff(base, head, [path])
+    candidate_diff = _candidate_diff(
+        head, tmp_path, {path: "select 1\nwhere active\n"}
+    )
+
+    verdict = run_allowlist_gate(
+        repo_root=head,
+        candidate_diff=candidate_diff,
+        pr_diff=pr_diff,
+        failure_kind="audit",
+        caps=DEFAULT_CAPS,
+    )
+    assert not verdict.passed
+    assert verdict.violation == "sql_deletion_not_a_restore"
+    assert "did not add" in verdict.reason
+
+
+def test_sql_removal_authorization_preserves_multiplicity(tmp_path: Path) -> None:
+    path = "models/a.sql"
+    base = _make_repo(tmp_path, {path: "select x\n"})
+    head = tmp_path / "pr-head"
+    shutil.copytree(base, head)
+    head.joinpath(path).write_text("select x\nselect x\n")
+    pr_diff = generate_unified_diff(base, head, [path])
+    candidate_diff = _candidate_diff(head, tmp_path, {path: ""})
+
+    verdict = run_allowlist_gate(
+        repo_root=head,
+        candidate_diff=candidate_diff,
+        pr_diff=pr_diff,
+        failure_kind="audit",
+        caps=DEFAULT_CAPS,
+    )
+    assert not verdict.passed
+    assert verdict.violation == "sql_deletion_not_a_restore"
 
 
 def test_sql_deletion_not_matching_pr_deletion_is_rejected(tmp_path: Path) -> None:
@@ -336,9 +414,10 @@ class _CountingRunner:
 
 
 def test_allowlist_gate_is_deterministic_and_never_calls_a_model(tmp_path: Path) -> None:
-    repo = _make_repo(tmp_path, {"models/a.sql": "select 1\nfrom x\nwhere y = 1\n"})
-    pr_diff = _candidate_diff(repo, tmp_path, {"models/a.sql": "select 1\nfrom x\n"})
-    candidate_diff = pr_diff
+    repo = _make_repo(tmp_path, {"models/a.sql": "select 1\n"})
+    candidate_diff = _candidate_diff(
+        repo, tmp_path, {"models/a.sql": "select 1\nfrom x\n"}
+    )
 
     runner = _CountingRunner()
 
@@ -346,7 +425,7 @@ def test_allowlist_gate_is_deterministic_and_never_calls_a_model(tmp_path: Path)
         run_allowlist_gate(
             repo_root=repo,
             candidate_diff=candidate_diff,
-            pr_diff=pr_diff,
+            pr_diff="",
             failure_kind="ci",
             caps=DEFAULT_CAPS,
         )
@@ -530,4 +609,3 @@ def test_relocating_a_test_to_a_different_persisting_column_is_rejected(tmp_path
         v = run_allowlist_gate(repo_root=repo, candidate_diff=diff, pr_diff="",
                                failure_kind=kind, caps=DEFAULT_CAPS)
         assert not v.passed, f"kind={kind}: relocation to a persisting column must be rejected"
-

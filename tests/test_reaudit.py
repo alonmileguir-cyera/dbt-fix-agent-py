@@ -665,6 +665,52 @@ def test_reaudit_passes_when_fix_fully_reverts_the_pr(tmp_path):
     assert called["n"] == 0  # auditor never invoked on an empty effective diff
 
 
+def test_reaudit_passes_when_fix_restores_a_pr_modified_line(tmp_path):
+    """A replacement B -> A exactly inverts the PR's A -> B replacement."""
+    from dbt_fixer.reaudit import ProcessOutcome, run_reaudit_gate
+
+    (tmp_path / "models").mkdir()
+    # repo_root is the checked-out PR head.
+    (tmp_path / "models" / "m.sql").write_text("select broken_name\n")
+    pr_diff = (
+        "diff --git a/models/m.sql b/models/m.sql\n"
+        "--- a/models/m.sql\n+++ b/models/m.sql\n@@ -1 +1 @@\n"
+        "-select original_name\n+select broken_name\n"
+    )
+    candidate = (
+        "diff --git a/models/m.sql b/models/m.sql\n"
+        "--- a/models/m.sql\n+++ b/models/m.sql\n@@ -1 +1 @@\n"
+        "-select broken_name\n+select original_name\n"
+    )
+    called = {"n": 0}
+
+    def runner(args, env, cwd, timeout_seconds):
+        called["n"] += 1
+        return ProcessOutcome(
+            returncode=0,
+            stdout="dbt-auditor-audit-status: failed\n",
+            stderr="",
+        )
+
+    verdict = run_reaudit_gate(
+        repo_root=tmp_path,
+        candidate_diff=candidate,
+        pr_diff=pr_diff,
+        pr_title="t",
+        pr_description="",
+        pr_url="u",
+        auditor_python="/fake/python",
+        failure_kind="audit",
+        originally_failing_check_ids=("schema_contract_verification",),
+        timeout_seconds=60.0,
+        subprocess_runner=runner,
+    )
+
+    assert verdict.passed, verdict.reason
+    assert "reverts" in verdict.reason
+    assert called["n"] == 0
+
+
 # --- red-team A: UNCONFIRMED originally-failing check must NOT count as pass ---
 def test_reaudit_rejects_unconfirmed_originally_failing_check(tmp_path):
     from dbt_fixer.reaudit import run_reaudit_gate, ProcessOutcome

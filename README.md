@@ -253,9 +253,10 @@ run through it any number of times always produces the same
 or true no-op candidate; any touched path outside `models/*.{yml,yaml,md,sql}`;
 exceeding `DBT_FIXER_MAX_CHANGED_FILES`/`DBT_FIXER_MAX_CHANGED_LINES`, or
 touching a hook, a `materialized` config change, or a masking/bypass
-keyword (checked independently of the caps); a `.sql` deletion that isn't
-an exact restore of a line the original PR diff itself removed from that
-same file; and a removed/weakened dbt schema test in a `.yml`/`.yaml` file
+keyword (checked independently of the caps); a `.sql` candidate removal that
+doesn't consume a matching line the original PR diff added to that same file
+(so fixes may correct/revert PR-authored SQL but not delete base SQL); and a
+removed/weakened dbt schema test in a `.yml`/`.yaml` file
 — categorically for `failure_kind=ci`, or for `failure_kind=audit` only
 when none of the originally-failing checks both names that test and
 explicitly proves it wrong in its evidence text.
